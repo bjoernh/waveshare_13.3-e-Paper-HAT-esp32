@@ -2,6 +2,14 @@
 
 Display images on a 13.3" Spectra 6 color e-ink display. This branch (`waveshare-nano-hat`) targets a Waveshare **ESP32-S3-Nano** wired to a Waveshare **13.3" e-Paper HAT+ (E)**. See the `main` branch for the original Seeed Studio XIAO ePaper Display Board (EE02) port.
 
+
+## Hardware
+
+- [13.3inch E Ink Spectra 6 (E6) Full color E-Paper Display, 1600×1200 Pixels, SPI Communication with HAT+ driver board ~ $260](https://www.waveshare.com/13.3inch-e-paper-hat-plus-e.htm?sku=29355)
+- [ESP32-S3-Nano Development Board - ESP32-S3R8 ~$10](https://www.waveshare.com/esp32-s3-nano.htm)
+- Lithium Battery + 1A step-up/down dc/dc converter 3.3V or USB-C power supply
+- Picture Frame mind. 30 x 40 cm    
+
 ## So what does this project do
 
 Custom firmware on the ESP32-S3-Nano that:
@@ -361,33 +369,6 @@ Set these in `platformio.ini` `build_flags` (not in `config.h`):
 ### Image is rotated incorrectly
 
 The server applies a 270° rotation for portrait-mounted displays (board at the bottom). Change the `img.rotate(270, ...)` call in `image_server.py` if your mount orientation differs.
-
----
-
-## File Structure
-
-```
-seeed_eink_board/
-├── README.md
-├── image_server.py           # Flask server — image rotation, packed binary, schedule editor
-├── Dockerfile                # Container image for the image server
-├── docker-compose.yml        # Traefik reverse proxy + image server
-├── .env.example              # Environment variable template for Docker
-├── images/                   # Per-device image directories
-│   ├── default/
-│   └── <mac-address>/
-├── device_config.json        # Global schedule fallback (optional)
-├── firmware/
-│   ├── platformio.ini        # Build config (board = arduino_nano_esp32)
-│   ├── README.md
-│   └── src/
-│       ├── config.h.example  # Copy to config.h and fill in credentials
-│       ├── config_manager.h  # Default server settings
-│       ├── display.h/.cpp    # Spectra 6 dual-controller driver
-│       ├── config_server.h/.cpp  # On-device web config UI
-│       └── main.cpp          # WiFi, fetch, display, sleep, config mode
-└── pyproject.toml
-```
 
 ---
 
