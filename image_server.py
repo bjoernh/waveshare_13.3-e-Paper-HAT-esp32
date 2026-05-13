@@ -115,13 +115,26 @@ SCHEDULE_KEYS = (
     "refresh_interval_minutes",
     "active_start_hour",
     "active_end_hour",
-    "timezone_offset_minutes",
 )
 
 # Image enhancement settings
 DEFAULT_CONTRAST = 1.2
 DEFAULT_BRIGHTNESS = 1.0
 DEFAULT_SATURATION = 1.2
+
+# Timezone — read from TZ environment variable (standard Linux convention).
+# Falls back to UTC when TZ is unset or invalid.
+_TZ_NAME = os.environ.get("TZ", "UTC")
+
+
+def get_timezone_offset_minutes() -> int:
+    """Return the current UTC offset in minutes from the TZ environment variable."""
+    try:
+        offset = datetime.now().astimezone().utcoffset()
+        return int(offset.total_seconds() / 60) if offset is not None else 0
+    except Exception:
+        return 0
+
 
 # Cache for processed image data
 _image_cache = {
@@ -198,13 +211,6 @@ def load_schedule_config(path: str) -> dict | None:
             config["active_end_hour"] = value
         else:
             print(f"Ignoring invalid active_end_hour in {path}: {value}")
-
-    if "timezone_offset_minutes" in raw:
-        value = raw["timezone_offset_minutes"]
-        if isinstance(value, int) and -720 <= value <= 840:
-            config["timezone_offset_minutes"] = value
-        else:
-            print(f"Ignoring invalid timezone_offset_minutes in {path}: {value}")
 
     if "refresh_interval_minutes" in raw:
         value = raw["refresh_interval_minutes"]
@@ -330,7 +336,6 @@ def parse_schedule_form(form) -> tuple[dict | None, str | None]:
         refresh_interval = int(form.get("refresh_interval_minutes", ""))
         active_start = int(form.get("active_start_hour", ""))
         active_end = int(form.get("active_end_hour", ""))
-        timezone_offset = int(form.get("timezone_offset_minutes", ""))
     except ValueError:
         return None, "All schedule fields must be integers."
 
@@ -340,14 +345,11 @@ def parse_schedule_form(form) -> tuple[dict | None, str | None]:
         return None, "Active start hour must be between 0 and 23."
     if not 0 <= active_end <= 23:
         return None, "Active end hour must be between 0 and 23."
-    if not -720 <= timezone_offset <= 840:
-        return None, "Timezone offset must be between -720 and 840 minutes."
 
     return {
         "refresh_interval_minutes": refresh_interval,
         "active_start_hour": active_start,
         "active_end_hour": active_end,
-        "timezone_offset_minutes": timezone_offset,
     }, None
 
 
@@ -427,10 +429,6 @@ def render_schedule_form_card(
             <label>Active End Hour</label>
             <input type="number" name="active_end_hour" min="0" max="23" value="{escape(str(state["form_values"]["active_end_hour"]))}" required>
           </div>
-          <div class="row">
-            <label>Timezone Offset (minutes from UTC)</label>
-            <input type="number" name="timezone_offset_minutes" min="-720" max="840" value="{escape(str(state["form_values"]["timezone_offset_minutes"]))}" required>
-          </div>
           <button type="submit">Save Override</button>
         </form>
         <form action="/schedule/clear" method="POST" style="margin-top:12px;">
@@ -451,14 +449,25 @@ def render_schedule_form_card(
 
 def render_schedule_editor(target: str, message: str = "", error: str = "") -> str:
     """Render a simple HTML editor for schedule overrides."""
-    shortcuts = "".join(
-        f'<li><a href="/schedule?target={escape(schedule_target)}">{escape(describe_schedule_target(schedule_target))}</a></li>'
-        for schedule_target in get_schedule_targets()
-    )
+    all_targets = get_schedule_targets()
     message_html = (
         f'<div class="message success">{escape(message)}</div>' if message else ""
     )
     error_html = f'<div class="message error">{escape(error)}</div>' if error else ""
+
+    # Render a card for every known target; if the queried target isn't in the
+    # known list (e.g. a custom MAC typed into the picker), show it first.
+    targets_to_render = list(all_targets)
+    if target not in targets_to_render:
+        targets_to_render.insert(0, target)
+
+    grid_cards = "".join(
+        render_schedule_form_card(
+            t,
+            include_target_picker=(t == target),
+        )
+        for t in targets_to_render
+    )
 
     return f"""
     <!DOCTYPE html>
@@ -467,7 +476,7 @@ def render_schedule_editor(target: str, message: str = "", error: str = "") -> s
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>Schedule Editor</title>
       <style>
-        body {{ font-family: Arial, sans-serif; max-width: 720px; margin: 32px auto; padding: 0 16px 48px; background: #f6f7f9; color: #222; }}
+        body {{ font-family: Arial, sans-serif; max-width: 1180px; margin: 32px auto; padding: 0 16px 48px; background: #f6f7f9; color: #222; }}
         h1, h2 {{ margin-bottom: 0.4rem; }}
         .card {{ background: white; border: 1px solid #ddd; border-radius: 8px; padding: 18px; margin-bottom: 16px; }}
         .row {{ margin-bottom: 14px; }}
@@ -481,8 +490,8 @@ def render_schedule_editor(target: str, message: str = "", error: str = "") -> s
         code, pre {{ background: #eef1f4; border-radius: 4px; }}
         code {{ padding: 2px 5px; }}
         pre {{ padding: 12px; overflow-x: auto; }}
-        ul {{ margin-top: 8px; }}
         .hint {{ color: #555; font-size: 0.95em; }}
+        .schedule-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; align-items: start; }}
       </style>
     </head>
     <body>
@@ -491,11 +500,8 @@ def render_schedule_editor(target: str, message: str = "", error: str = "") -> s
       {message_html}
       {error_html}
 
-      {render_schedule_form_card(target, include_target_picker=True)}
-
-      <div class="card">
-        <h2>Shortcuts</h2>
-        <ul>{shortcuts}</ul>
+      <div class="schedule-grid">
+        {grid_cards}
       </div>
     </body>
     </html>
@@ -1091,6 +1097,8 @@ def device_config():
     g.device_id = None if device_id == DEFAULT_DEVICE_ID else device_id
     log_battery_status(device_id, emit_log=True)
 
+    tz_offset = get_timezone_offset_minutes()
+
     if _preview_state["enabled"]:
         # Override schedule: always active, fast refresh, no quiet hours.
         payload = {
@@ -1100,7 +1108,7 @@ def device_config():
             "refresh_interval_minutes": 3,
             "active_start_hour": 0,
             "active_end_hour": 0,  # start == end triggers always-active in firmware
-            "timezone_offset_minutes": 0,
+            "timezone_offset_minutes": tz_offset,
             "preview_mode": True,
         }
         log_message("Device config (preview mode)", device_id=g.device_id)
@@ -1110,12 +1118,13 @@ def device_config():
             "device_id": device_id,
             "server_time_epoch": int(datetime.now().timestamp()),
             "config_source": config_source,
+            "timezone_offset_minutes": tz_offset,
         }
         payload.update(schedule_config)
         log_message(
             f"Device config: refresh_interval_minutes={payload.get('refresh_interval_minutes')} "
             f"active_hours={payload.get('active_start_hour')}-{payload.get('active_end_hour')} "
-            f"timezone_offset_minutes={payload.get('timezone_offset_minutes')}",
+            f"timezone_offset_minutes={tz_offset} (TZ={_TZ_NAME})",
             device_id=g.device_id,
         )
 
@@ -1338,13 +1347,6 @@ def index():
         f'<div class="message success">{escape(message)}</div>' if message else ""
     )
     error_html = f'<div class="message error">{escape(error)}</div>' if error else ""
-    schedule_cards = [
-        render_schedule_form_card(GLOBAL_SCHEDULE_TARGET, redirect_to="/"),
-        render_schedule_form_card(DEFAULT_DEVICE_ID, redirect_to="/"),
-    ]
-    for dev_id in all_devices:
-        schedule_cards.append(render_schedule_form_card(dev_id, redirect_to="/"))
-
     # Build device status table
     device_rows = ""
     for dev_id in all_devices:
@@ -1362,8 +1364,7 @@ def index():
         if schedule_config:
             schedule_summary = (
                 f"{schedule_config.get('active_start_hour', '-')}:00-"
-                f"{schedule_config.get('active_end_hour', '-')}:00 "
-                f"@ {schedule_config.get('timezone_offset_minutes', '-')} min"
+                f"{schedule_config.get('active_end_hour', '-')}:00"
             )
         else:
             schedule_summary = "No override"
@@ -1400,13 +1401,31 @@ def index():
         .success {{ background: #e7f6ea; border: 1px solid #9bd0a7; }}
         .error {{ background: #fdecec; border: 1px solid #e2a4a4; }}
         .hint {{ color: #555; font-size: 0.95em; }}
-        .schedule-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; align-items: start; }}
         table {{ width: 100%; background: white; border-collapse: collapse; }}
         th, td {{ border: 1px solid #d9d9d9; padding: 8px; vertical-align: top; text-align: left; }}
         code, pre {{ background: #eef1f4; border-radius: 4px; }}
         code {{ padding: 2px 5px; }}
         pre {{ padding: 12px; overflow-x: auto; }}
         ul {{ margin-top: 8px; }}
+        .nav-cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin: 20px 0 28px; }}
+        .nav-card {{ display: block; background: white; border: 1px solid #ddd; border-radius: 8px; padding: 16px 18px; text-decoration: none; color: #222; }}
+        .nav-card:hover {{ border-color: #0b67d0; box-shadow: 0 2px 8px rgba(11,103,208,0.12); }}
+        .nav-card-title {{ font-weight: bold; font-size: 1.05em; margin-bottom: 4px; color: #0b67d0; }}
+        .nav-card-desc {{ font-size: 0.88em; color: #555; }}
+        details summary {{ cursor: pointer; color: #555; font-size: 0.93em; }}
+        details summary:hover {{ color: #0b67d0; }}
+        .preview-banner {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; border-radius: 8px; padding: 12px 16px; margin: 12px 0 4px; }}
+        .preview-banner.on {{ background: #fff3cd; border: 2px solid #e6a817; font-weight: bold; }}
+        .preview-banner.off {{ background: #f0f4f8; border: 1px solid #d0d7de; color: #666; }}
+        .img-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; margin-top: 14px; }}
+        .img-tile {{ position: relative; }}
+        .img-tile-btn {{ background: white; border: 3px solid transparent; border-radius: 8px; padding: 8px; cursor: pointer; width: 100%; text-align: center; position: relative; transition: border-color 0.15s, box-shadow 0.15s; box-sizing: border-box; }}
+        .img-tile-btn:hover {{ border-color: #0b67d0; box-shadow: 0 2px 10px rgba(11,103,208,0.18); }}
+        .img-tile-btn.active {{ border-color: #0b67d0; box-shadow: 0 0 0 2px rgba(11,103,208,0.2); }}
+        .img-tile-label {{ margin-top: 6px; font-size: 0.78em; color: #333; word-break: break-all; white-space: normal; }}
+        .active-badge {{ position: absolute; top: 6px; left: 6px; background: #0b67d0; color: white; font-size: 0.7em; padding: 2px 7px; border-radius: 10px; pointer-events: none; font-weight: bold; letter-spacing: 0.02em; z-index: 1; }}
+        .delete-btn {{ position: absolute; top: 4px; right: 4px; width: 24px; height: 24px; border-radius: 50%; background: #c43d31; color: white; border: none; cursor: pointer; font-size: 13px; line-height: 1; padding: 0; display: flex; align-items: center; justify-content: center; opacity: 0; transition: opacity 0.15s; z-index: 1; }}
+        .img-tile:hover .delete-btn {{ opacity: 1; }}
       </style>
     </head>
     <body>
@@ -1414,36 +1433,24 @@ def index():
     {"" if not _preview_state["enabled"] else f'<div style="background:#fff3cd;border:2px solid #e6a817;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-weight:bold;">&#9888; Preview mode active &mdash; showing <code>{escape(_preview_state["image_label"] or "")}</code> on all devices. Rotation and scheduling are suspended.</div>'}
     {message_html}
     {error_html}
-    <h2>Endpoints</h2>
-    <ul>
-        <li><a href="/image_packed">/image_packed</a> - Packed binary for ESP32 (960KB, advances rotation)</li>
-        <li><a href="/hash">/hash</a> - Image hash for change detection (16 chars)</li>
-        <li><a href="/device_config">/device_config</a> - Current epoch time plus optional schedule overrides</li>
-        <li><a href="/schedule">/schedule</a> - Browser UI for editing schedule overrides</li>
-        <li><a href="/upload">/upload</a> - Upload a new image from the browser</li>
-        <li><a href="/">/</a> - Preview mode control (enable/disable fixed-image display)</li>
-        <li><a href="/current">/current</a> - Current rotation status (JSON)</li>
-        <li><a href="/image">/image</a> - Transformed JPEG preview</li>
-        <li><a href="/imagejpg">/imagejpg</a> - Random front page image</li>
-    </ul>
-    <p><em>Endpoints accept <code>X-Device-MAC</code> header for device identification.</em></p>
-
-    <h2>Schedule Shortcuts</h2>
-    <ul>
-        <li><a href="/schedule?target=global">Edit global fallback schedule</a></li>
-        <li><a href="/schedule?target=default">Edit default device schedule</a></li>
-    </ul>
-
-    <h2>Preview Mode</h2>
+    <div class="nav-cards">
+      <a href="/schedule" class="nav-card">
+        <div class="nav-card-title">Schedule Editor</div>
+        <div class="nav-card-desc">Edit refresh intervals and active hours per device</div>
+      </a>
+      <a href="/upload" class="nav-card">
+        <div class="nav-card-title">Upload Image</div>
+        <div class="nav-card-desc">Add new images from your browser</div>
+      </a>
+      <a href="/images/default" class="nav-card">
+        <div class="nav-card-title">Browse Images</div>
+        <div class="nav-card-desc">View and delete images in the default folder</div>
+      </a>
+    </div>
     {render_preview_card(redirect_to="/")}
 
     <h2>Upload Image</h2>
     {render_upload_card(message=message, error=error, redirect_to="/")}
-
-    <h2>Schedule Editor</h2>
-    <div class="schedule-grid">
-    {"".join(schedule_cards)}
-    </div>
 
     <h2>Device Status</h2>
     <table border="1" cellpadding="8" cellspacing="0">
@@ -1481,6 +1488,19 @@ images/
     </pre>
     <p>Create a directory named after the device's MAC address (lowercase, no separators) to serve device-specific images.</p>
     <p>Optional schedule overrides live in <code>device_config.json</code> and can set <code>active_start_hour</code>, <code>active_end_hour</code>, <code>timezone_offset_minutes</code>, and <code>refresh_interval_minutes</code>.</p>
+
+    <details style="margin-top: 32px;">
+      <summary>API / Technical endpoints</summary>
+      <ul style="margin-top: 10px;">
+        <li><code><a href="/image_packed">/image_packed</a></code> &mdash; Packed binary for ESP32 (960 KB, advances rotation)</li>
+        <li><code><a href="/hash">/hash</a></code> &mdash; Image hash for change detection (16 chars)</li>
+        <li><code><a href="/device_config">/device_config</a></code> &mdash; Current epoch time plus optional schedule overrides</li>
+        <li><code><a href="/current">/current</a></code> &mdash; Rotation status (JSON)</li>
+        <li><code><a href="/image">/image</a></code> &mdash; Transformed JPEG preview</li>
+        <li><code><a href="/imagejpg">/imagejpg</a></code> &mdash; Random front page image</li>
+      </ul>
+      <p><em>All endpoints accept <code>X-Device-MAC</code> header for device identification.</em></p>
+    </details>
     </body>
     </html>
     """
@@ -1513,28 +1533,53 @@ def render_preview_card(
     label = _preview_state["image_label"] or ""
 
     all_images = get_all_images()
-    options = "\n".join(
-        f'          <option value="{escape(lbl)}" {"selected" if lbl == label else ""}>'
-        f"{escape(lbl)}</option>"
-        for lbl, _ in all_images
-    )
-    no_images_hint = (
-        ""
-        if all_images
-        else '<div class="hint">No images found in images/ directory.</div>'
-    )
 
     if enabled:
-        status_html = f'<p><strong>Status:</strong> <span style="color:#b05c00;font-weight:bold">PREVIEW ACTIVE</span> &mdash; <code>{escape(label)}</code></p>'
+        banner_html = f"""
+        <div class="preview-banner on">
+          <form action="/preview/disable" method="POST" style="margin:0;flex-shrink:0;">
+            <input type="hidden" name="redirect_to" value="{escape(redirect_to)}">
+            <button type="submit" class="danger">Disable Preview</button>
+          </form>
+          <span>Preview active &mdash; <code>{escape(label)}</code></span>
+        </div>"""
     else:
-        status_html = (
-            '<p><strong>Status:</strong> <span style="color:#555">Off</span></p>'
-        )
+        banner_html = '<div class="preview-banner off">Preview off &mdash; normal rotation active</div>'
 
     message_html = (
         f'<div class="message success">{escape(message)}</div>' if message else ""
     )
     error_html = f'<div class="message error">{escape(error)}</div>' if error else ""
+
+    if not all_images:
+        grid_html = '<div class="hint" style="margin-top:12px;">No images found in images/ directory.</div>'
+    else:
+        cards = ""
+        for lbl, _ in all_images:
+            active = lbl == label
+            active_class = " active" if active else ""
+            badge = '<div class="active-badge">Active</div>' if active else ""
+            fname = escape(lbl.split("/")[-1])
+            cards += f"""
+            <div class="img-tile">
+              <form action="/preview/enable" method="POST" style="margin:0;">
+                <input type="hidden" name="redirect_to" value="{escape(redirect_to)}">
+                <input type="hidden" name="image" value="{escape(lbl)}">
+                <button type="submit" title="Send to all devices: {escape(lbl)}" class="img-tile-btn{active_class}">
+                  {badge}
+                  <img src="/images/thumb/{escape(lbl)}" alt="{escape(lbl)}"
+                       style="width:100%;height:160px;object-fit:contain;display:block;border-radius:4px;background:#eef1f4;">
+                  <div class="img-tile-label">{escape(lbl)}</div>
+                </button>
+              </form>
+              <form action="/images/delete" method="POST" style="position:absolute;top:4px;right:4px;margin:0;"
+                    onsubmit="return confirm('Delete {fname}?')">
+                <input type="hidden" name="label" value="{escape(lbl)}">
+                <input type="hidden" name="redirect_to" value="{escape(redirect_to)}">
+                <button type="submit" title="Delete {escape(lbl)}" class="delete-btn">&#x2715;</button>
+              </form>
+            </div>"""
+        grid_html = f'<div class="img-grid">{cards}</div>'
 
     return f"""
       <div class="card">
@@ -1543,22 +1588,9 @@ def render_preview_card(
         Rotation and quiet-hours scheduling are suspended.</p>
         {message_html}
         {error_html}
-        {status_html}
-        <form action="/preview/enable" method="POST" style="margin-bottom:10px;">
-          <input type="hidden" name="redirect_to" value="{escape(redirect_to)}">
-          <div class="row">
-            <label for="preview-image">Image to preview</label>
-            <select id="preview-image" name="image" required {"disabled" if not all_images else ""}>
-              {options}
-            </select>
-            {no_images_hint}
-          </div>
-          <button type="submit" {"disabled" if not all_images else ""}>Enable Preview</button>
-        </form>
-        <form action="/preview/disable" method="POST">
-          <input type="hidden" name="redirect_to" value="{escape(redirect_to)}">
-          <button type="submit" class="danger" {"disabled" if not enabled else ""}>Disable Preview</button>
-        </form>
+        {banner_html}
+        <p class="hint" style="margin-top:10px;">Click an image to send it to all devices. Hover to reveal the delete button.</p>
+        {grid_html}
       </div>
     """
 
@@ -1686,6 +1718,153 @@ def upload_image():
     log_message(f"Uploaded {filename} to images/{target_label}/")
     message = quote_plus(f"Uploaded '{filename}' to images/{target_label}/")
     return redirect(f"{redirect_to}?message={message}")
+
+
+@app.route("/images/default")
+def images_default_gallery():
+    """Gallery of images in the default folder with delete buttons."""
+    default_dir = os.path.join(IMAGES_DIR, DEFAULT_DEVICE_ID)
+    message = request.args.get("message", "")
+    error = request.args.get("error", "")
+    message_html = f'<div class="message success">{escape(message)}</div>' if message else ""
+    error_html = f'<div class="message error">{escape(error)}</div>' if error else ""
+
+    images = []
+    if os.path.isdir(default_dir):
+        for entry in sorted(os.scandir(default_dir), key=lambda e: e.name):
+            real_path = os.path.realpath(entry.path)
+            if not os.path.isfile(real_path):
+                continue
+            _, ext = os.path.splitext(entry.name.lower())
+            if ext not in SUPPORTED_EXTENSIONS:
+                continue
+            images.append(entry.name)
+
+    cards = ""
+    for name in images:
+        label = f"default/{name}"
+        cards += f"""
+        <div class="img-card">
+          <img src="/images/thumb/{escape(label)}" alt="{escape(name)}" loading="lazy">
+          <div class="img-name">{escape(name)}</div>
+          <form action="/images/delete" method="POST"
+                onsubmit="return confirm('Delete {escape(name)}?')">
+            <input type="hidden" name="filename" value="{escape(name)}">
+            <input type="hidden" name="redirect_to" value="/images/default">
+            <button type="submit" class="danger">Delete</button>
+          </form>
+        </div>"""
+
+    empty_html = "" if images else '<p class="hint">No images in the default folder.</p>'
+
+    return f"""<!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Default Images — E-Ink Server</title>
+      <style>
+        body {{ font-family: Arial, sans-serif; max-width: 1200px; margin: 32px auto; padding: 0 16px 48px; background: #f6f7f9; color: #222; }}
+        h1 {{ margin-bottom: 0.4rem; }}
+        .message {{ padding: 12px 14px; border-radius: 6px; margin-bottom: 16px; }}
+        .success {{ background: #e7f6ea; border: 1px solid #9bd0a7; }}
+        .error {{ background: #fdecec; border: 1px solid #e2a4a4; }}
+        .hint {{ color: #555; font-size: 0.95em; }}
+        .gallery {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; margin-top: 16px; }}
+        .img-card {{ background: white; border: 1px solid #ddd; border-radius: 8px; padding: 12px; text-align: center; }}
+        .img-card img {{ width: 100%; height: 260px; object-fit: contain; border-radius: 4px; background: #eef1f4; }}
+        .img-name {{ margin: 8px 0; font-size: 0.85em; word-break: break-all; color: #333; }}
+        button {{ background: #0b67d0; color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; }}
+        button.danger {{ background: #c43d31; width: 100%; margin-top: 4px; }}
+        code {{ background: #eef1f4; border-radius: 4px; padding: 2px 5px; }}
+      </style>
+    </head>
+    <body>
+      <h1>Default Images</h1>
+      <p><a href="/">&#8592; Back to server status</a></p>
+      {message_html}
+      {error_html}
+      <p>{len(images)} image(s) in <code>images/default/</code></p>
+      {empty_html}
+      <div class="gallery">{cards}</div>
+    </body>
+    </html>"""
+
+
+@app.route("/images/thumb/<path:label>")
+def image_thumb(label: str):
+    """Serve a small JPEG thumbnail of an image from the images directory."""
+    if not PIL_AVAILABLE:
+        return "PIL not available", 500
+    candidate = os.path.realpath(os.path.join(IMAGES_DIR, label))
+    images_root = os.path.realpath(IMAGES_DIR)
+    if not candidate.startswith(images_root + os.sep):
+        return "Invalid path", 400
+    if not os.path.isfile(candidate):
+        return "Not found", 404
+    _, ext = os.path.splitext(candidate.lower())
+    if ext not in SUPPORTED_EXTENSIONS:
+        return "Unsupported file type", 400
+    try:
+        img = Image.open(candidate)
+        img = ImageOps.exif_transpose(img)
+        img = img.convert("RGB")
+        img.thumbnail((300, 400), Image.Resampling.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=75)
+        buf.seek(0)
+        return Response(buf.read(), mimetype="image/jpeg")
+    except Exception as e:
+        return f"Error generating thumbnail: {e}", 500
+
+
+@app.route("/images/delete", methods=["POST"])
+def images_delete():
+    """Delete an image from the images directory."""
+    redirect_to = request.form.get("redirect_to", "/images/default") or "/images/default"
+
+    label = request.form.get("label", "").strip()
+    if label:
+        parts = label.split("/", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return redirect(f"{redirect_to}?error={quote_plus('Invalid label.')}")
+        subdir, filename = parts
+    else:
+        subdir = DEFAULT_DEVICE_ID
+        filename = request.form.get("filename", "").strip()
+
+    if not filename:
+        return redirect(f"{redirect_to}?error={quote_plus('No filename specified.')}")
+
+    safe_subdir = secure_filename(subdir)
+    safe_name = secure_filename(filename)
+    if not safe_subdir or not safe_name:
+        return redirect(f"{redirect_to}?error={quote_plus('Invalid path.')}")
+
+    images_root = os.path.realpath(IMAGES_DIR)
+    target_dir = os.path.realpath(os.path.join(IMAGES_DIR, safe_subdir))
+    if not target_dir.startswith(images_root + os.sep):
+        return redirect(f"{redirect_to}?error={quote_plus('Invalid path.')}")
+
+    candidate = os.path.realpath(os.path.join(target_dir, safe_name))
+    if not candidate.startswith(target_dir + os.sep):
+        return redirect(f"{redirect_to}?error={quote_plus('Invalid path.')}")
+    if not os.path.isfile(candidate):
+        return redirect(f"{redirect_to}?error={quote_plus(f'File not found: {safe_name}')}")
+
+    if _image_cache.get("source_path") == candidate:
+        _image_cache["data"] = None
+        _image_cache["hash"] = None
+        _image_cache["source_path"] = None
+        _image_cache["source_mtime"] = None
+
+    if _preview_state["enabled"] and _preview_state["image_path"] == candidate:
+        _preview_state["enabled"] = False
+        _preview_state["image_path"] = None
+        _preview_state["image_label"] = None
+
+    os.remove(candidate)
+    log_message(f"Deleted image: {safe_subdir}/{safe_name}")
+    return redirect(f"{redirect_to}?message={quote_plus(f'Deleted {safe_name}')}")
 
 
 @app.route("/preview/enable", methods=["POST"])
