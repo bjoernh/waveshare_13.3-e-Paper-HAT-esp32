@@ -1,0 +1,15 @@
+.git/
+.pio/
+.venv/
+__pycache__/
+*.py[oc]
+firmware/
+images/
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.webp
+.eink_rotation_state.json
+device_config.json
+.DS_Store

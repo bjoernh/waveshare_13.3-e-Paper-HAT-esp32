@@ -1,6 +1,6 @@
-# EE02 E-Ink Display Firmware
+# Waveshare ESP32-S3-Nano + 13.3" HAT+ (E) Firmware
 
-Custom firmware for the Seeed Studio XIAO ePaper Display Board (EE02) driving a 13.3" Spectra 6 e-ink display.
+Custom firmware for a Waveshare ESP32-S3-Nano wired to a Waveshare 13.3" e-Paper HAT+ (E) Spectra 6 display. See the `main` branch for the original Seeed XIAO ePaper Display Board (EE02) port.
 
 ## Features
 
@@ -56,7 +56,7 @@ uv run pio run
 
 ### 4. Flash the Firmware
 
-Connect the EE02 board via USB. If the device is in deep sleep, press the reset button to wake it.
+Connect the ESP32-S3-Nano via USB-C. If the device is in deep sleep, press the reset button to wake it.
 
 ```bash
 uv run pio run -t upload --upload-port /dev/ttyACM0
@@ -88,7 +88,7 @@ The server runs on `http://0.0.0.0:5000` with these endpoints:
 
 ### 6. Test
 
-Press the reset button on the EE02 board. The display should:
+Press the reset button on the ESP32-S3-Nano. The display should:
 1. Connect to WiFi
 2. Sync current time and optional schedule overrides from `/device_config`
 3. Skip work and go back to sleep if it is currently in quiet hours
@@ -143,7 +143,7 @@ done
 
 ```
 ========================================
-Seeed EE02 E-Ink Display Firmware
+Waveshare ESP32-S3-Nano + 13.3" HAT+ (E)
 ========================================
 Boot count: 1
 Wakeup was not from deep sleep (code: 0)
@@ -212,11 +212,11 @@ The firmware supports runtime configuration without reflashing.
 
 ### Entering Configuration Mode
 
-**Hold Button 1 during reset:**
-1. Hold Button 1 (GPIO2)
-2. While holding, press and release the reset button
-3. Continue holding Button 1 for an additional second
-4. Release Button 1
+**Hold the user button during reset:**
+1. Hold the user button (momentary switch from D2 to GND)
+2. While holding, press and release the RESET button on the Nano
+3. Continue holding the user button for an additional second
+4. Release the user button
 
 The device will enter configuration mode and either:
 - **STA mode**: Connect to your WiFi and show its IP address
@@ -325,18 +325,24 @@ firmware/
 
 ## Hardware Reference
 
-### Pin Configuration (EE02 Board)
+### Pin Configuration (ESP32-S3-Nano → 13.3" HAT+ (E))
 
-| Function | GPIO | Notes |
-|----------|------|-------|
-| SPI CLK | 7 | Shared by both controllers |
-| SPI MOSI | 9 | Shared by both controllers |
-| CS Master | 44 | Top half of display (rows 0-599) |
-| CS Slave | 41 | Bottom half of display (rows 600-1199) |
-| DC | 10 | Data/Command select |
-| Reset | 38 | Hardware reset |
-| Busy | 4 | LOW when busy, HIGH when ready |
-| Power | 43 | Display power control |
+| HAT+ pin | Function     | Nano label | ESP32-S3 GPIO |
+|----------|--------------|------------|---------------|
+| VCC      | 3.3 V        | 3V3        | —             |
+| GND      | GND          | GND        | —             |
+| DIN      | SPI MOSI     | D11        | GPIO38        |
+| CLK      | SPI SCK      | D13        | GPIO48        |
+| CS_M     | Master CS    | D10        | GPIO21        |
+| CS_S     | Slave CS     | D9         | GPIO18        |
+| DC       | Data/Command | D8         | GPIO17        |
+| RST      | Reset        | D7         | GPIO10        |
+| BUSY     | Busy (in)    | D6         | GPIO9         |
+| PWR      | Power enable | D5         | GPIO8         |
+
+Plus, on the Nano:
+- **D2** — user config button to GND (internal pull-up); hold during boot for 1 second to enter web configuration mode.
+- **A0 / A1** — reserved for an optional external battery voltage divider (see `config.h`; off by default).
 
 ### Display Specifications
 
@@ -366,5 +372,5 @@ For battery operation, increase the sleep interval to maximize battery life. At 
 
 ## Credits
 
-- Display driver based on [esphome-bigink](https://github.com/acegallagher/esphome-bigink)
+- Display driver init values verified against Waveshare's reference Arduino driver (`../ESP32/EPD_13in3e.cpp`) and against the original [esphome-bigink](https://github.com/acegallagher/esphome-bigink) port
 - Image processing based on the GooDisplay project in `~/eink`

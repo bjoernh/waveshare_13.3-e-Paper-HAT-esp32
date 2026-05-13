@@ -1,0 +1,40 @@
+services:
+  traefik:
+    image: traefik:v3
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      # Uncomment for HTTPS with Let's Encrypt:
+      # - --entrypoints.websecure.address=:443
+      # - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      # - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      # - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      # - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      # - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+    ports:
+      - "80:80"
+      # - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # - letsencrypt:/letsencrypt
+
+  image-server:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ./images:/app/images
+      # Pre-create before first run: touch eink_rotation_state.json
+      - ./eink_rotation_state.json:/app/.eink_rotation_state.json
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.eink.rule=Host(`${EINK_HOST}`)
+      - traefik.http.routers.eink.entrypoints=web
+      - traefik.http.services.eink.loadbalancer.server.port=8000
+      # Uncomment for HTTPS:
+      # - traefik.http.routers.eink.entrypoints=websecure
+      # - traefik.http.routers.eink.tls.certresolver=le
+
+# volumes:
+#   letsencrypt:

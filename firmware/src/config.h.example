@@ -9,33 +9,40 @@
 // Image Server Configuration
 // NOTE: These are now configurable at runtime via the web interface!
 // These values are only used as initial defaults on first boot.
-// To change the server, hold Button 1 (GPIO2) during boot to enter config mode.
+// To change the server, hold the user button (D2) during boot to enter config mode.
 //
 // Default values are defined in config_manager.h:
 //   DEFAULT_SERVER_HOST "192.168.86.100"
-//   DEFAULT_SERVER_PORT 5000
+//   DEFAULT_SERVER_PORT 8000
 //   DEFAULT_IMAGE_ENDPOINT "/image_packed"
 //   DEFAULT_SLEEP_MINUTES 15
 
-// Display Pin Configuration (EE02 Board)
-// These pins are fixed for the EE02 board - do not change
-#define PIN_SPI_CLK     7
-#define PIN_SPI_MOSI    9
-#define PIN_CS_MASTER   44    // Master controller (top half)
-#define PIN_CS_SLAVE    41    // Slave controller (bottom half)
-#define PIN_DC          10
-#define PIN_RESET       38
-#define PIN_BUSY        4     // Note: Busy signal is inverted on this board
-#define PIN_POWER       43    // Display power control
+// Display Pin Configuration
+// Waveshare 13.3" e-Paper HAT+ (E) wired to a Waveshare ESP32-S3-Nano.
+// Pin names use the Arduino Nano D/A macros so the code works whether the
+// Arduino core is in "By Arduino pin" or "By GPIO number" mode.
+#define PIN_SPI_CLK     D13   // SCK  (HAT+ CLK)
+#define PIN_SPI_MOSI    D11   // MOSI (HAT+ DIN)
+#define PIN_CS_MASTER   D10   // HAT+ CS_M (master controller chip select)
+#define PIN_CS_SLAVE    D9    // HAT+ CS_S (slave controller chip select)
+#define PIN_DC          D8    // Data / Command
+#define PIN_RESET       D7
+#define PIN_BUSY        D6    // LOW = busy, HIGH = idle
+#define PIN_POWER       D5    // HAT+ PWR (HIGH = enable, LOW = power-gate panel)
 
-// Button Pin Configuration (active LOW - directly connected to GND when pressed)
-#define PIN_BUTTON_1    2     // Config mode: hold during boot to enter setup
-#define PIN_BUTTON_3    3     // Available for future use
+// User button: momentary switch from D2 to GND (uses internal pull-up).
+// Hold during boot for 1 second to enter the web configuration mode.
+#define PIN_BUTTON_1    D2
 
-// Battery ADC Configuration (EE02 board has voltage divider on GPIO1)
-#define PIN_BATTERY_ADC   1   // A0/GPIO1 - Battery voltage via voltage divider
-#define PIN_ADC_ENABLE    6   // A5/GPIO6 - Enable the voltage divider circuit
-#define BATTERY_SCALE     7.16  // Voltage divider scaling factor (from EE04 reference)
+// Optional external battery voltage divider.
+// The ESP32-S3-Nano has no on-board divider; uncomment BATTERY_MONITOR_ENABLED
+// and wire your own divider (Vbat -> R1 -> A0 -> R2 -> GND) if you want to
+// report battery voltage to the server via the X-Battery-Voltage header.
+// Calibrate BATTERY_SCALE = (R1 + R2) / R2 for your resistor values.
+// #define BATTERY_MONITOR_ENABLED  1
+#define PIN_BATTERY_ADC   A0
+#define PIN_ADC_ENABLE    A1
+#define BATTERY_SCALE     2.0f
 
 // Display Dimensions
 #define DISPLAY_WIDTH   1600
@@ -56,5 +63,21 @@
 
 // WiFi connection timeout (in milliseconds)
 #define WIFI_TIMEOUT_MS 30000
+
+// Static IP configuration (optional).
+// Assigning a fixed IP skips DHCP negotiation on every wake from deep sleep,
+// which saves ~200-500 ms and a few mA of radio time per boot cycle.
+// Comment out STATIC_IP to fall back to DHCP.
+// #define STATIC_IP       "192.168.x.y"
+// #define STATIC_GATEWAY  "192.168.x.1"
+// #define STATIC_SUBNET   "255.255.255.0"
+// #define STATIC_DNS1     "192.168.x.1"
+
+// Development: simulated display mode
+// When enabled, all SPI/GPIO/refresh operations are skipped so the panel is
+// not stressed during debugging sessions.  The image buffer is still allocated
+// and populated normally, so all download/processing logic can be tested.
+// Enable via platformio.ini build_flags instead of editing this file:
+//   -DSIM_DISPLAY
 
 #endif // CONFIG_H

@@ -38,10 +38,12 @@ RTC_DATA_ATTR int bootCount = 0;
 RTC_DATA_ATTR char lastImageHash[17] = {0};  // 16 chars + null terminator
 char pendingImageHash[17] = {0};
 
-// Battery voltage (read once per boot, sent to server with requests)
+// Battery voltage (read once per boot, sent to server with requests).
+// Stays at -1.0 when BATTERY_MONITOR_ENABLED is not defined, which causes
+// addCommonHeaders() to skip the X-Battery-Voltage header.
 float batteryVoltage = -1.0;
 
-// Configuration mode: hold Button 1 during boot for 1 second
+// Configuration mode: hold the user button (D2) during boot for 1 second
 #define CONFIG_BUTTON_HOLD_MS 1000
 #define DEVICE_CONFIG_ENDPOINT "/device_config"
 #define MIN_SLEEP_SECONDS 60
@@ -64,9 +66,11 @@ String getMACAddressClean() {
     return String(macStr);
 }
 
+#ifdef BATTERY_MONITOR_ENABLED
 /**
- * Read battery voltage via the on-board voltage divider.
- * GPIO6 enables the divider circuit, GPIO1 reads the divided voltage.
+ * Read battery voltage via an external voltage divider.
+ * PIN_ADC_ENABLE drives a switched divider (HIGH = on); leave that pin
+ * unconnected if your divider is always on.
  * Returns voltage in volts (e.g., 3.85), or -1.0 if reading seems invalid.
  */
 float readBatteryVoltage() {
@@ -97,6 +101,7 @@ float readBatteryVoltage() {
     Serial.printf("Battery: ADC=%.0f, voltage=%.2fV\n", avgAdc, voltage);
     return voltage;
 }
+#endif // BATTERY_MONITOR_ENABLED
 
 void addCommonHeaders(HTTPClient& http) {
     String macAddress = getMACAddressClean();
@@ -359,6 +364,19 @@ bool connectWiFi() {
     Serial.printf("Connecting to WiFi: %s\n", WIFI_SSID);
 
     WiFi.mode(WIFI_STA);
+
+#ifdef STATIC_IP
+    {
+        IPAddress ip, gateway, subnet, dns1;
+        ip.fromString(STATIC_IP);
+        gateway.fromString(STATIC_GATEWAY);
+        subnet.fromString(STATIC_SUBNET);
+        dns1.fromString(STATIC_DNS1);
+        WiFi.config(ip, gateway, subnet, dns1);
+        Serial.printf("Static IP: %s\n", STATIC_IP);
+    }
+#endif
+
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     uint32_t startTime = millis();
@@ -548,6 +566,22 @@ bool fetchAndDisplayImage() {
 void enterDeepSleep(uint32_t sleepSeconds) {
     uint32_t sleepMinutes = sleepSeconds / 60;
     uint32_t remainderSeconds = sleepSeconds % 60;
+
+#ifdef DEV_DISABLE_DEEP_SLEEP
+    // Development mode: simulate the sleep with a short delay and a soft reboot
+    // so USB stays connected and the loop iterates quickly.
+    uint32_t devDelay = sleepSeconds;
+#ifdef DEV_LOOP_DELAY_SECONDS
+    if (devDelay > DEV_LOOP_DELAY_SECONDS) devDelay = DEV_LOOP_DELAY_SECONDS;
+#endif
+    Serial.printf("[DEV] Deep sleep disabled. Would sleep for %lu min %lu s; "
+                  "waiting %lu s then restarting.\n",
+                  sleepMinutes, remainderSeconds, devDelay);
+    digitalWrite(PIN_POWER, LOW);
+    Serial.flush();
+    delay(devDelay * 1000UL);
+    ESP.restart();
+#else
     Serial.printf("Entering deep sleep for %lu minutes %lu seconds...\n", sleepMinutes, remainderSeconds);
 
     // Configure timer wakeup
@@ -561,6 +595,7 @@ void enterDeepSleep(uint32_t sleepSeconds) {
     Serial.println("Going to sleep now...");
     Serial.flush();
     esp_deep_sleep_start();
+#endif
 }
 
 void runConfigMode() {
@@ -591,8 +626,10 @@ void runNormalMode() {
     Serial.println("NORMAL OPERATION MODE");
     Serial.println("========================================\n");
 
+#ifdef BATTERY_MONITOR_ENABLED
     // Read battery voltage before WiFi (ADC can be noisy during WiFi)
     batteryVoltage = readBatteryVoltage();
+#endif
 
     // Connect to WiFi first (needed for hash check)
     if (!connectWiFi()) {
@@ -645,10 +682,20 @@ void runNormalMode() {
 
 void setup() {
     Serial.begin(115200);
+
+    // The arduino_nano_esp32 board variant uses GPIO 46/0/45 for its RGB status
+    // LED and the WiFi stack drives them during init. Configure them as outputs
+    // now so the framework doesn't emit "IO X is not set as GPIO" warnings.
+#if defined(LED_RED) && defined(LED_GREEN) && defined(LED_BLUE)
+    pinMode(LED_RED,   OUTPUT);
+    pinMode(LED_GREEN, OUTPUT);
+    pinMode(LED_BLUE,  OUTPUT);
+#endif
+
     delay(1000);  // Give serial time to connect
 
     Serial.println("\n========================================");
-    Serial.println("Seeed EE02 E-Ink Display Firmware");
+    Serial.println("Waveshare ESP32-S3-Nano + 13.3\" HAT+ (E)");
     Serial.println("========================================");
 
     bootCount++;
@@ -658,7 +705,7 @@ void setup() {
     // Initialize configuration manager
     configManager.begin();
 
-    // Check if config button (Button 1 / GPIO2) is held to enter config mode
+    // Check if the user button (D2) is held to enter config mode
     if (checkConfigButton()) {
         runConfigMode();
         // runConfigMode never returns

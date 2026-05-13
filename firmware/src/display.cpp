@@ -1,6 +1,9 @@
 #include "display.h"
 
-// Initialization data from Seeed's T133A01_Defines.h (via esphome-bigink)
+// Initialization data for the dual-IC E6 Spectra 6 panel.
+// Register values are byte-for-byte identical to Waveshare's reference driver
+// (e-Paper/E-paper_Separate_Program/13.3inch_e-Paper_E/ESP32/EPD_13in3e.cpp)
+// and to Seeed's T133A01_Defines.h port (via esphome-bigink).
 
 // Commands to MASTER only
 static const uint8_t R74_DATA[] = {0xC0, 0x1C, 0x1C, 0xCC, 0xCC, 0xCC, 0x15, 0x15, 0x55};
@@ -55,6 +58,15 @@ bool Spectra6Display::begin() {
     // Clear buffer to white
     memset(buffer_, 0x11, BUFFER_SIZE);  // 0x11 = two white pixels
 
+#ifdef SIM_DISPLAY
+    // Keep the panel unpowered but configure the power pin so main.cpp can
+    // safely call digitalWrite(PIN_POWER, LOW) in enterDeepSleep().
+    pinMode(PIN_POWER, OUTPUT);
+    digitalWrite(PIN_POWER, LOW);
+    Serial.println("Spectra6: [SIM] GPIO and hardware init skipped");
+    return true;
+#endif
+
     // Configure GPIO pins
     pinMode(PIN_CS_MASTER, OUTPUT);
     digitalWrite(PIN_CS_MASTER, HIGH);
@@ -95,6 +107,11 @@ void Spectra6Display::refresh() {
     Serial.println("Spectra6: Starting display refresh...");
     uint32_t startTime = millis();
 
+#ifdef SIM_DISPLAY
+    Serial.printf("Spectra6: [SIM] Refresh skipped in %lu ms\n", millis() - startTime);
+    return;
+#endif
+
     // Re-initialize display before transfer
     hardwareReset();
     initializeDisplay();
@@ -127,6 +144,9 @@ void Spectra6Display::sleep() {
 // ============================================================================
 
 void Spectra6Display::hardwareReset() {
+#ifdef SIM_DISPLAY
+    return;
+#endif
     Serial.println("Spectra6: Hardware reset");
     digitalWrite(PIN_RESET, LOW);
     delay(20);
@@ -136,8 +156,11 @@ void Spectra6Display::hardwareReset() {
 }
 
 bool Spectra6Display::waitUntilIdle(uint32_t timeoutMs) {
+#ifdef SIM_DISPLAY
+    return true;
+#endif
     uint32_t start = millis();
-    // Note: Busy pin on EE02 is inverted - reads LOW when busy, HIGH when ready
+    // Busy pin: LOW = controller busy, HIGH = idle.
     while (digitalRead(PIN_BUSY) == LOW) {
         delay(10);
         if (millis() - start > timeoutMs) {
@@ -153,6 +176,9 @@ bool Spectra6Display::waitUntilIdle(uint32_t timeoutMs) {
 // ============================================================================
 
 void Spectra6Display::spiBegin() {
+#ifdef SIM_DISPLAY
+    return;
+#endif
     if (!spiInitialized_) {
         SPI.begin(PIN_SPI_CLK, -1, PIN_SPI_MOSI, -1);
         spiInitialized_ = true;
@@ -161,14 +187,25 @@ void Spectra6Display::spiBegin() {
 }
 
 void Spectra6Display::spiEnd() {
+#ifdef SIM_DISPLAY
+    return;
+#endif
     SPI.endTransaction();
 }
 
 void Spectra6Display::spiWriteByte(uint8_t data) {
+#ifdef SIM_DISPLAY
+    (void)data;
+    return;
+#endif
     SPI.transfer(data);
 }
 
 void Spectra6Display::spiWriteArray(const uint8_t* data, size_t len) {
+#ifdef SIM_DISPLAY
+    (void)data; (void)len;
+    return;
+#endif
     SPI.transferBytes(data, nullptr, len);
 }
 

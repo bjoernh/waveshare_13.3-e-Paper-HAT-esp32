@@ -6,7 +6,7 @@
 #include "config.h"
 
 /**
- * Seeed 13.3" Spectra 6 E-Paper Display Driver
+ * Waveshare 13.3" e-Paper HAT+ (E) Spectra 6 Display Driver
  *
  * Hardware: Dual UC8179 controllers in master/slave configuration
  * Resolution: 1600 x 1200 pixels, 6 colors (Black, White, Red, Yellow, Blue, Green)

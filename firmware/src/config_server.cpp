@@ -213,7 +213,7 @@ String ConfigServer::generateConfigPage() {
             <input type="text" name="host" value=")";
     html += config_.getServerHost();
     html += R"(" required>
-            <span class="current">e.g., 192.168.86.100 or myserver.example.com</span>
+            <span class="current">e.g., 192.168.188.6 or myserver.example.com</span>
         </div>
 
         <div class="form-group">

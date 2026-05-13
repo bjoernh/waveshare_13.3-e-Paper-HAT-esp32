@@ -13,26 +13,38 @@ Endpoints:
 
 Usage:
     python image_server.py
-    # Server runs on http://0.0.0.0:5000
+    # Server runs on http://0.0.0.0:8000
 """
 
-from flask import Flask, send_file, Response, jsonify, request, redirect, g, has_request_context
-import requests
-import wand.image
-from io import BytesIO
-import random
-import os
 import hashlib
 import json
 import logging
+import os
+import random
 import time
 from datetime import datetime
 from html import escape
+from io import BytesIO
 from urllib.parse import quote_plus
+
+import requests
+import wand.image
+from flask import (
+    Flask,
+    Response,
+    g,
+    has_request_context,
+    jsonify,
+    redirect,
+    request,
+    send_file,
+)
+from werkzeug.utils import secure_filename
 
 # Try to import PIL for image processing
 try:
-    from PIL import Image, ImageOps, ImageEnhance
+    from PIL import Image, ImageEnhance, ImageOps
+
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -41,6 +53,7 @@ except ImportError:
 # Try to import pillow-heif for HEIC support
 try:
     import pillow_heif
+
     pillow_heif.register_heif_opener()
     HEIC_SUPPORT = True
 except ImportError:
@@ -54,9 +67,10 @@ except ImportError:
     urls = []
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
 
 user_agent = "Mozilla/5.0 (Wayland; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-headers = {'User-Agent': user_agent}
+headers = {"User-Agent": user_agent}
 
 # Display configuration
 # Note: Buffer is 1600x1200 to match firmware expectations
@@ -67,12 +81,12 @@ BUFFER_SIZE = 960000  # (1600 * 1200) / 2 bytes
 
 # The Spectra 6 Color Palette (RGB)
 PALETTE_RGB = [
-    (0, 0, 0),       # Black
-    (255, 255, 255), # White
-    (255, 255, 0),   # Yellow
-    (255, 0, 0),     # Red
-    (0, 0, 255),     # Blue
-    (41, 204, 20)    # Green
+    (0, 0, 0),  # Black
+    (255, 255, 255),  # White
+    (255, 255, 0),  # Yellow
+    (255, 0, 0),  # Red
+    (0, 0, 255),  # Blue
+    (41, 204, 20),  # Green
 ]
 
 # Map palette index to hardware 4-bit codes
@@ -82,7 +96,7 @@ HARDWARE_MAP = {
     2: 0x02,  # Yellow
     3: 0x03,  # Red
     4: 0x05,  # Blue
-    5: 0x06   # Green
+    5: 0x06,  # Green
 }
 
 # Image to display - change this path to your desired image
@@ -94,14 +108,14 @@ IMAGES_DIR = os.path.join(SCRIPT_DIR, "images")
 STATE_FILE = os.path.join(SCRIPT_DIR, ".eink_rotation_state.json")
 DEVICE_CONFIG_FILENAME = "device_config.json"
 GLOBAL_DEVICE_CONFIG_PATH = os.path.join(SCRIPT_DIR, DEVICE_CONFIG_FILENAME)
-SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.heic', '.webp'}
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".heic", ".webp"}
 DEFAULT_DEVICE_ID = "default"
 GLOBAL_SCHEDULE_TARGET = "global"
 SCHEDULE_KEYS = (
-    'refresh_interval_minutes',
-    'active_start_hour',
-    'active_end_hour',
-    'timezone_offset_minutes',
+    "refresh_interval_minutes",
+    "active_start_hour",
+    "active_end_hour",
+    "timezone_offset_minutes",
 )
 
 # Image enhancement settings
@@ -111,16 +125,46 @@ DEFAULT_SATURATION = 1.2
 
 # Cache for processed image data
 _image_cache = {
-    'data': None,
-    'hash': None,
-    'source_path': None,   # Path to the source image
-    'source_mtime': None,  # Modification time of source image
+    "data": None,
+    "hash": None,
+    "source_path": None,  # Path to the source image
+    "source_mtime": None,  # Modification time of source image
 }
 
 
 def normalize_mac(mac_str: str) -> str:
     """Convert MAC address to lowercase, no separators."""
-    return mac_str.lower().replace(':', '').replace('-', '').replace(' ', '')
+    return mac_str.lower().replace(":", "").replace("-", "").replace(" ", "")
+
+
+def get_image_directories() -> list[str]:
+    """Return sorted list of subdirectories under IMAGES_DIR, with 'default' always first."""
+    dirs: list[str] = []
+    if os.path.isdir(IMAGES_DIR):
+        for entry in os.scandir(IMAGES_DIR):
+            if entry.is_dir():
+                dirs.append(entry.name)
+    dirs.sort()
+    if DEFAULT_DEVICE_ID not in dirs:
+        dirs.insert(0, DEFAULT_DEVICE_ID)
+    return dirs
+
+
+def resolve_upload_dir(target: str) -> str | None:
+    """
+    Return the absolute path for an upload target directory, or None if invalid.
+    Normalises MAC-style input and prevents path traversal.
+    """
+    cleaned = target.strip()
+    if ":" in cleaned or "-" in cleaned:
+        cleaned = normalize_mac(cleaned)
+    if not cleaned or cleaned.startswith("."):
+        return None
+    candidate = os.path.realpath(os.path.join(IMAGES_DIR, cleaned))
+    images_root = os.path.realpath(IMAGES_DIR)
+    if not candidate.startswith(images_root + os.sep) and candidate != images_root:
+        return None
+    return candidate
 
 
 def load_schedule_config(path: str) -> dict | None:
@@ -129,7 +173,7 @@ def load_schedule_config(path: str) -> dict | None:
         return None
 
     try:
-        with open(path, 'r') as f:
+        with open(path, "r") as f:
             raw = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
         print(f"Error loading device config {path}: {e}")
@@ -141,31 +185,31 @@ def load_schedule_config(path: str) -> dict | None:
 
     config = {}
 
-    if 'active_start_hour' in raw:
-        value = raw['active_start_hour']
+    if "active_start_hour" in raw:
+        value = raw["active_start_hour"]
         if isinstance(value, int) and 0 <= value <= 23:
-            config['active_start_hour'] = value
+            config["active_start_hour"] = value
         else:
             print(f"Ignoring invalid active_start_hour in {path}: {value}")
 
-    if 'active_end_hour' in raw:
-        value = raw['active_end_hour']
+    if "active_end_hour" in raw:
+        value = raw["active_end_hour"]
         if isinstance(value, int) and 0 <= value <= 23:
-            config['active_end_hour'] = value
+            config["active_end_hour"] = value
         else:
             print(f"Ignoring invalid active_end_hour in {path}: {value}")
 
-    if 'timezone_offset_minutes' in raw:
-        value = raw['timezone_offset_minutes']
+    if "timezone_offset_minutes" in raw:
+        value = raw["timezone_offset_minutes"]
         if isinstance(value, int) and -720 <= value <= 840:
-            config['timezone_offset_minutes'] = value
+            config["timezone_offset_minutes"] = value
         else:
             print(f"Ignoring invalid timezone_offset_minutes in {path}: {value}")
 
-    if 'refresh_interval_minutes' in raw:
-        value = raw['refresh_interval_minutes']
+    if "refresh_interval_minutes" in raw:
+        value = raw["refresh_interval_minutes"]
         if isinstance(value, int) and 1 <= value <= 1440:
-            config['refresh_interval_minutes'] = value
+            config["refresh_interval_minutes"] = value
         else:
             print(f"Ignoring invalid refresh_interval_minutes in {path}: {value}")
 
@@ -178,12 +222,17 @@ def get_device_schedule_config(device_id: str) -> tuple[dict, str]:
 
     if device_id != DEFAULT_DEVICE_ID:
         candidate_paths.append(
-            (os.path.join(IMAGES_DIR, device_id, DEVICE_CONFIG_FILENAME), f"images/{device_id}/{DEVICE_CONFIG_FILENAME}")
+            (
+                os.path.join(IMAGES_DIR, device_id, DEVICE_CONFIG_FILENAME),
+                f"images/{device_id}/{DEVICE_CONFIG_FILENAME}",
+            )
         )
 
     candidate_paths.append(
-        (os.path.join(IMAGES_DIR, DEFAULT_DEVICE_ID, DEVICE_CONFIG_FILENAME),
-         f"images/{DEFAULT_DEVICE_ID}/{DEVICE_CONFIG_FILENAME}")
+        (
+            os.path.join(IMAGES_DIR, DEFAULT_DEVICE_ID, DEVICE_CONFIG_FILENAME),
+            f"images/{DEFAULT_DEVICE_ID}/{DEVICE_CONFIG_FILENAME}",
+        )
     )
     candidate_paths.append((GLOBAL_DEVICE_CONFIG_PATH, DEVICE_CONFIG_FILENAME))
 
@@ -241,18 +290,18 @@ def get_schedule_editor_state(target: str) -> dict:
 
     form_values = {}
     for key in SCHEDULE_KEYS:
-        value = exact_config.get(key, effective_config.get(key, ''))
+        value = exact_config.get(key, effective_config.get(key, ""))
         form_values[key] = value
 
     return {
-        'target': target,
-        'label': describe_schedule_target(target),
-        'exact_path': exact_path,
-        'exact_config': exact_config,
-        'effective_config': effective_config,
-        'effective_source': effective_source,
-        'form_values': form_values,
-        'has_override': os.path.exists(exact_path),
+        "target": target,
+        "label": describe_schedule_target(target),
+        "exact_path": exact_path,
+        "exact_config": exact_config,
+        "effective_config": effective_config,
+        "effective_source": effective_source,
+        "form_values": form_values,
+        "has_override": os.path.exists(exact_path),
     }
 
 
@@ -262,9 +311,9 @@ def save_schedule_config(path: str, config: dict) -> None:
     if directory:
         os.makedirs(directory, exist_ok=True)
 
-    with open(path, 'w') as f:
+    with open(path, "w") as f:
         json.dump(config, f, indent=2)
-        f.write('\n')
+        f.write("\n")
 
 
 def delete_schedule_config(path: str) -> bool:
@@ -278,10 +327,10 @@ def delete_schedule_config(path: str) -> bool:
 def parse_schedule_form(form) -> tuple[dict | None, str | None]:
     """Validate schedule editor form input."""
     try:
-        refresh_interval = int(form.get('refresh_interval_minutes', ''))
-        active_start = int(form.get('active_start_hour', ''))
-        active_end = int(form.get('active_end_hour', ''))
-        timezone_offset = int(form.get('timezone_offset_minutes', ''))
+        refresh_interval = int(form.get("refresh_interval_minutes", ""))
+        active_start = int(form.get("active_start_hour", ""))
+        active_end = int(form.get("active_end_hour", ""))
+        timezone_offset = int(form.get("timezone_offset_minutes", ""))
     except ValueError:
         return None, "All schedule fields must be integers."
 
@@ -295,10 +344,10 @@ def parse_schedule_form(form) -> tuple[dict | None, str | None]:
         return None, "Timezone offset must be between -720 and 840 minutes."
 
     return {
-        'refresh_interval_minutes': refresh_interval,
-        'active_start_hour': active_start,
-        'active_end_hour': active_end,
-        'timezone_offset_minutes': timezone_offset,
+        "refresh_interval_minutes": refresh_interval,
+        "active_start_hour": active_start,
+        "active_end_hour": active_end,
+        "timezone_offset_minutes": timezone_offset,
     }, None
 
 
@@ -306,23 +355,38 @@ def get_schedule_targets() -> list[str]:
     """Return editor shortcut targets."""
     targets = {GLOBAL_SCHEDULE_TARGET, DEFAULT_DEVICE_ID}
     targets.update(_rotator.get_all_devices())
-    targets.discard('')
-    return sorted(targets, key=lambda value: (value not in {GLOBAL_SCHEDULE_TARGET, DEFAULT_DEVICE_ID}, value))
+    targets.discard("")
+    return sorted(
+        targets,
+        key=lambda value: (
+            value not in {GLOBAL_SCHEDULE_TARGET, DEFAULT_DEVICE_ID},
+            value,
+        ),
+    )
 
 
-def render_schedule_form_card(target: str, include_target_picker: bool = False,
-                              redirect_to: str = "/schedule") -> str:
+def render_schedule_form_card(
+    target: str, include_target_picker: bool = False, redirect_to: str = "/schedule"
+) -> str:
     """Render a schedule override form card for a specific target."""
     state = get_schedule_editor_state(target)
-    exact_json = escape(json.dumps(state['exact_config'], indent=2)) if state['exact_config'] else '{}'
-    effective_json = escape(json.dumps(state['effective_config'], indent=2)) if state['effective_config'] else '{}'
+    exact_json = (
+        escape(json.dumps(state["exact_config"], indent=2))
+        if state["exact_config"]
+        else "{}"
+    )
+    effective_json = (
+        escape(json.dumps(state["effective_config"], indent=2))
+        if state["effective_config"]
+        else "{}"
+    )
     network_info_html = ""
 
     if target not in {GLOBAL_SCHEDULE_TARGET, DEFAULT_DEVICE_ID}:
         network_info = _device_network_status.get(target)
         if network_info:
             network_info_html = (
-                f'<p><strong>Last IP:</strong> <code>{escape(network_info["ip"])}</code><br>'
+                f"<p><strong>Last IP:</strong> <code>{escape(network_info['ip'])}</code><br>"
                 f'<span class="hint">Last seen: {escape(network_info["timestamp"])}</span></p>'
             )
         else:
@@ -334,7 +398,7 @@ def render_schedule_form_card(target: str, include_target_picker: bool = False,
         <form action="/schedule" method="GET" style="margin-top: 12px;">
           <div class="row">
             <label for="target">Edit target</label>
-            <input id="target" type="text" name="target" value="{escape(state['target'])}" placeholder="global, default, or device MAC">
+            <input id="target" type="text" name="target" value="{escape(state["target"])}" placeholder="global, default, or device MAC">
             <div class="hint">Use <code>global</code>, <code>default</code>, or a MAC like <code>d0cf1326f7e8</code>.</div>
           </div>
           <button type="submit">Open Target</button>
@@ -343,34 +407,34 @@ def render_schedule_form_card(target: str, include_target_picker: bool = False,
 
     return f"""
       <div class="card">
-        <h2>{escape(state['label'])}</h2>
-        <p><strong>Override file:</strong> <code>{escape(state['exact_path'])}</code></p>
-        <p><strong>Effective source:</strong> <code>{escape(state['effective_source'])}</code></p>
+        <h2>{escape(state["label"])}</h2>
+        <p><strong>Override file:</strong> <code>{escape(state["exact_path"])}</code></p>
+        <p><strong>Effective source:</strong> <code>{escape(state["effective_source"])}</code></p>
         {network_info_html}
         {target_picker_html}
         <form action="/schedule/save" method="POST">
-          <input type="hidden" name="target" value="{escape(state['target'])}">
+          <input type="hidden" name="target" value="{escape(state["target"])}">
           <input type="hidden" name="redirect_to" value="{escape(redirect_to)}">
           <div class="row">
             <label>Refresh Interval (minutes)</label>
-            <input type="number" name="refresh_interval_minutes" min="1" max="1440" value="{escape(str(state['form_values']['refresh_interval_minutes']))}" required>
+            <input type="number" name="refresh_interval_minutes" min="1" max="1440" value="{escape(str(state["form_values"]["refresh_interval_minutes"]))}" required>
           </div>
           <div class="row">
             <label>Active Start Hour</label>
-            <input type="number" name="active_start_hour" min="0" max="23" value="{escape(str(state['form_values']['active_start_hour']))}" required>
+            <input type="number" name="active_start_hour" min="0" max="23" value="{escape(str(state["form_values"]["active_start_hour"]))}" required>
           </div>
           <div class="row">
             <label>Active End Hour</label>
-            <input type="number" name="active_end_hour" min="0" max="23" value="{escape(str(state['form_values']['active_end_hour']))}" required>
+            <input type="number" name="active_end_hour" min="0" max="23" value="{escape(str(state["form_values"]["active_end_hour"]))}" required>
           </div>
           <div class="row">
             <label>Timezone Offset (minutes from UTC)</label>
-            <input type="number" name="timezone_offset_minutes" min="-720" max="840" value="{escape(str(state['form_values']['timezone_offset_minutes']))}" required>
+            <input type="number" name="timezone_offset_minutes" min="-720" max="840" value="{escape(str(state["form_values"]["timezone_offset_minutes"]))}" required>
           </div>
           <button type="submit">Save Override</button>
         </form>
         <form action="/schedule/clear" method="POST" style="margin-top:12px;">
-          <input type="hidden" name="target" value="{escape(state['target'])}">
+          <input type="hidden" name="target" value="{escape(state["target"])}">
           <input type="hidden" name="redirect_to" value="{escape(redirect_to)}">
           <button type="submit" class="danger">Clear Override</button>
           <span class="hint">Deletes only the exact file for this target.</span>
@@ -387,12 +451,14 @@ def render_schedule_form_card(target: str, include_target_picker: bool = False,
 
 def render_schedule_editor(target: str, message: str = "", error: str = "") -> str:
     """Render a simple HTML editor for schedule overrides."""
-    shortcuts = ''.join(
+    shortcuts = "".join(
         f'<li><a href="/schedule?target={escape(schedule_target)}">{escape(describe_schedule_target(schedule_target))}</a></li>'
         for schedule_target in get_schedule_targets()
     )
-    message_html = f'<div class="message success">{escape(message)}</div>' if message else ''
-    error_html = f'<div class="message error">{escape(error)}</div>' if error else ''
+    message_html = (
+        f'<div class="message success">{escape(message)}</div>' if message else ""
+    )
+    error_html = f'<div class="message error">{escape(error)}</div>' if error else ""
 
     return f"""
     <!DOCTYPE html>
@@ -449,16 +515,16 @@ class ImageRotator:
         """Load rotation state from JSON file (per-device format)."""
         if os.path.exists(self.state_file):
             try:
-                with open(self.state_file, 'r') as f:
+                with open(self.state_file, "r") as f:
                     state = json.load(f)
                 # Check if it's the old single-device format and migrate
-                if 'current_index' in state and 'last_returned' in state:
+                if "current_index" in state and "last_returned" in state:
                     # Old format - migrate to new per-device format under 'default'
                     print("Migrating old state file format to per-device format")
                     self._device_states = {
                         DEFAULT_DEVICE_ID: {
-                            'current_index': state.get('current_index', 0),
-                            'last_returned': state.get('last_returned', None)
+                            "current_index": state.get("current_index", 0),
+                            "last_returned": state.get("last_returned", None),
                         }
                     }
                     self._save_state()
@@ -475,7 +541,7 @@ class ImageRotator:
     def _save_state(self):
         """Save rotation state to JSON file (per-device format)."""
         try:
-            with open(self.state_file, 'w') as f:
+            with open(self.state_file, "w") as f:
                 json.dump(self._device_states, f, indent=2)
         except IOError as e:
             print(f"Error saving state file: {e}")
@@ -483,10 +549,7 @@ class ImageRotator:
     def _get_device_state(self, device_id: str) -> dict:
         """Get or create state for a specific device."""
         if device_id not in self._device_states:
-            self._device_states[device_id] = {
-                'current_index': 0,
-                'last_returned': None
-            }
+            self._device_states[device_id] = {"current_index": 0, "last_returned": None}
         return self._device_states[device_id]
 
     def _get_device_dir(self, device_id: str) -> str:
@@ -539,10 +602,10 @@ class ImageRotator:
         state = self._get_device_state(device_id)
         device_dir = self._get_device_dir(device_id)
 
-        if state['current_index'] >= len(images):
-            state['current_index'] = 0
+        if state["current_index"] >= len(images):
+            state["current_index"] = 0
 
-        image_name = images[state['current_index']]
+        image_name = images[state["current_index"]]
         return os.path.join(device_dir, image_name)
 
     def mark_image_served(self, device_id: str = DEFAULT_DEVICE_ID) -> str | None:
@@ -552,12 +615,12 @@ class ImageRotator:
             return None
 
         state = self._get_device_state(device_id)
-        if state['current_index'] >= len(images):
-            state['current_index'] = 0
+        if state["current_index"] >= len(images):
+            state["current_index"] = 0
 
-        image_name = images[state['current_index']]
-        state['last_returned'] = image_name
-        state['current_index'] = (state['current_index'] + 1) % len(images)
+        image_name = images[state["current_index"]]
+        state["last_returned"] = image_name
+        state["current_index"] = (state["current_index"] + 1) % len(images)
         self._save_state()
 
         return image_name
@@ -581,8 +644,10 @@ class ImageRotator:
         state = self._get_device_state(device_id)
         device_dir = self._get_device_dir(device_id)
 
-        if state['last_returned'] and os.path.exists(os.path.join(device_dir, state['last_returned'])):
-            return os.path.join(device_dir, state['last_returned'])
+        if state["last_returned"] and os.path.exists(
+            os.path.join(device_dir, state["last_returned"])
+        ):
+            return os.path.join(device_dir, state["last_returned"])
         return None
 
     def get_status(self, device_id: str = DEFAULT_DEVICE_ID) -> dict:
@@ -591,12 +656,12 @@ class ImageRotator:
         images = self._scan_directory(device_id)
         device_dir = self._get_device_dir(device_id)
         return {
-            'device_id': device_id,
-            'current_image': state['last_returned'],
-            'current_index': state['current_index'],
-            'total_images': len(images),
-            'images_dir': device_dir,
-            'image_list': images
+            "device_id": device_id,
+            "current_image": state["last_returned"],
+            "current_index": state["current_index"],
+            "total_images": len(images),
+            "images_dir": device_dir,
+            "image_list": images,
         }
 
     def get_all_devices(self) -> list[str]:
@@ -613,13 +678,21 @@ _battery_status = {}
 # Last-seen device network info: {device_id: {ip, timestamp}}
 _device_network_status = {}
 
+# Preview mode: when enabled, all devices receive a single fixed image and the
+# schedule/quiet-hours logic is bypassed so the display refreshes immediately.
+_preview_state: dict = {
+    "enabled": False,
+    "image_path": None,  # absolute path to the selected image
+    "image_label": None,  # human-readable label, e.g. "default/photo.jpg"
+}
+
 
 def get_request_device_id() -> str | None:
     """Return the normalized device ID for the current request when available."""
     if not has_request_context():
         return None
 
-    device_mac = request.headers.get('X-Device-MAC')
+    device_mac = request.headers.get("X-Device-MAC")
     if not device_mac:
         return None
 
@@ -631,18 +704,24 @@ def get_request_ip() -> str | None:
     if not has_request_context():
         return None
 
-    return request.remote_addr or 'unknown'
+    return request.remote_addr or "unknown"
 
 
-def format_log_prefix(device_id: str | None = None, ip_address: str | None = None) -> str:
+def format_log_prefix(
+    device_id: str | None = None, ip_address: str | None = None
+) -> str:
     """Build a consistent log prefix for device-scoped request logs."""
     resolved_device_id = device_id
     resolved_ip = ip_address
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if has_request_context():
-        resolved_device_id = resolved_device_id or getattr(g, 'device_id', None) or get_request_device_id()
-        resolved_ip = resolved_ip or getattr(g, 'device_ip', None) or get_request_ip()
+        resolved_device_id = (
+            resolved_device_id
+            or getattr(g, "device_id", None)
+            or get_request_device_id()
+        )
+        resolved_ip = resolved_ip or getattr(g, "device_ip", None) or get_request_ip()
 
     if resolved_device_id and resolved_ip:
         return f"[{timestamp}] [{resolved_device_id} ({resolved_ip})]"
@@ -653,7 +732,9 @@ def format_log_prefix(device_id: str | None = None, ip_address: str | None = Non
     return f"[{timestamp}] [server]"
 
 
-def log_message(message: str, device_id: str | None = None, ip_address: str | None = None):
+def log_message(
+    message: str, device_id: str | None = None, ip_address: str | None = None
+):
     """Print a log line with a consistent request-aware prefix."""
     print(f"{format_log_prefix(device_id=device_id, ip_address=ip_address)} {message}")
 
@@ -664,8 +745,8 @@ def record_device_request(device_id: str):
         return
 
     _device_network_status[device_id] = {
-        'ip': request.remote_addr or 'unknown',
-        'timestamp': datetime.now().isoformat(timespec='seconds')
+        "ip": request.remote_addr or "unknown",
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
 
 
@@ -673,13 +754,13 @@ def log_battery_status(device_id: str, emit_log: bool = False):
     """Extract battery voltage from request header and optionally log it."""
     record_device_request(device_id)
 
-    voltage_str = request.headers.get('X-Battery-Voltage')
+    voltage_str = request.headers.get("X-Battery-Voltage")
     if voltage_str:
         try:
             voltage = float(voltage_str)
             _battery_status[device_id] = {
-                'voltage': voltage,
-                'timestamp': datetime.now().isoformat(timespec='seconds')
+                "voltage": voltage,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
             }
             if emit_log:
                 level = "LOW" if voltage < 3.3 else "OK" if voltage < 3.7 else "GOOD"
@@ -699,20 +780,22 @@ def prepare_request_logging():
 @app.after_request
 def log_request_summary(response):
     """Emit a single access log line with device and IP context."""
-    started_at = getattr(g, 'request_started_at', None)
-    elapsed_ms = int((time.perf_counter() - started_at) * 1000) if started_at is not None else 0
+    started_at = getattr(g, "request_started_at", None)
+    elapsed_ms = (
+        int((time.perf_counter() - started_at) * 1000) if started_at is not None else 0
+    )
     path = request.full_path[:-1] if request.query_string else request.path
     log_message(
         f"{request.method} {path} -> {response.status_code} ({elapsed_ms}ms)",
-        device_id=getattr(g, 'device_id', None),
-        ip_address=getattr(g, 'device_ip', None),
+        device_id=getattr(g, "device_id", None),
+        ip_address=getattr(g, "device_ip", None),
     )
     return response
 
 
 def create_palette_image():
     """Create a palette image for PIL quantization."""
-    palette_img = Image.new('P', (1, 1))
+    palette_img = Image.new("P", (1, 1))
     palette_data = []
     for r, g, b in PALETTE_RGB:
         palette_data.extend([r, g, b])
@@ -722,9 +805,12 @@ def create_palette_image():
     return palette_img
 
 
-def process_image_to_packed(image_path, contrast=DEFAULT_CONTRAST,
-                            brightness=DEFAULT_BRIGHTNESS,
-                            saturation=DEFAULT_SATURATION):
+def process_image_to_packed(
+    image_path,
+    contrast=DEFAULT_CONTRAST,
+    brightness=DEFAULT_BRIGHTNESS,
+    saturation=DEFAULT_SATURATION,
+):
     """
     Process an image file to packed 4bpp binary data for the Spectra 6 display.
 
@@ -747,9 +833,12 @@ def process_image_to_packed(image_path, contrast=DEFAULT_CONTRAST,
 
     # For portrait-mounted display: fit to portrait dimensions first,
     # then rotate to match the 1600x1200 buffer layout expected by firmware
-    img = ImageOps.fit(img, (FRAME_HEIGHT, FRAME_WIDTH),  # 1200x1600 portrait
-                       method=Image.Resampling.LANCZOS,
-                       centering=(0.5, 0.0))
+    img = ImageOps.fit(
+        img,
+        (FRAME_HEIGHT, FRAME_WIDTH),  # 1200x1600 portrait
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.0),
+    )
 
     # Rotate 270° (90° clockwise) to convert portrait image to landscape buffer
     # and match the physical display orientation with board attached at bottom
@@ -766,9 +855,7 @@ def process_image_to_packed(image_path, contrast=DEFAULT_CONTRAST,
     # Quantize to 6-color palette with Floyd-Steinberg dithering
     palette_img = create_palette_image()
     dithered = img.quantize(
-        colors=len(PALETTE_RGB),
-        palette=palette_img,
-        dither=Image.Dither.FLOYDSTEINBERG
+        colors=len(PALETTE_RGB), palette=palette_img, dither=Image.Dither.FLOYDSTEINBERG
     )
 
     # Pack bits (2 pixels per byte)
@@ -777,7 +864,7 @@ def process_image_to_packed(image_path, contrast=DEFAULT_CONTRAST,
 
     for i in range(0, len(pixels), 2):
         p1_idx = pixels[i]
-        p2_idx = pixels[i+1] if i+1 < len(pixels) else 0
+        p2_idx = pixels[i + 1] if i + 1 < len(pixels) else 0
 
         val1 = HARDWARE_MAP.get(p1_idx, 0x01)
         val2 = HARDWARE_MAP.get(p2_idx, 0x01)
@@ -809,11 +896,13 @@ def get_cached_image_data(image_path: str):
     # Check if source image has changed
     current_mtime = os.path.getmtime(real_path)
 
-    if (_image_cache['data'] is not None and
-        _image_cache['source_path'] == real_path and
-        _image_cache['source_mtime'] == current_mtime):
+    if (
+        _image_cache["data"] is not None
+        and _image_cache["source_path"] == real_path
+        and _image_cache["source_mtime"] == current_mtime
+    ):
         # Cache is valid
-        return _image_cache['data'], _image_cache['hash']
+        return _image_cache["data"], _image_cache["hash"]
 
     # Process the image
     log_message(f"Processing image: {image_path}")
@@ -823,10 +912,10 @@ def get_cached_image_data(image_path: str):
     image_hash = hashlib.md5(packed_data).hexdigest()[:16]
 
     # Update cache
-    _image_cache['data'] = packed_data
-    _image_cache['hash'] = image_hash
-    _image_cache['source_path'] = real_path
-    _image_cache['source_mtime'] = current_mtime
+    _image_cache["data"] = packed_data
+    _image_cache["hash"] = image_hash
+    _image_cache["source_path"] = real_path
+    _image_cache["source_mtime"] = current_mtime
 
     log_message(f"Image processed, hash: {image_hash}")
     return packed_data, image_hash
@@ -903,10 +992,12 @@ def display_image(uri, w=None, h=None):
     print(uri)
     try:
         response = requests.get(uri, timeout=5.0, headers=headers)
-    except (requests.exceptions.ConnectionError,
-            requests.exceptions.TooManyRedirects,
-            requests.exceptions.ChunkedEncodingError,
-            requests.exceptions.ReadTimeout) as e:
+    except (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.TooManyRedirects,
+        requests.exceptions.ChunkedEncodingError,
+        requests.exceptions.ReadTimeout,
+    ) as e:
         print(f"requests.get({uri}) generated exception:\n{e}")
         return False
 
@@ -921,13 +1012,15 @@ def display_image(uri, w=None, h=None):
     try:
         img = wand.image.Image(file=BytesIO(response.content))
     except Exception as e:
-        print(f"wand.image.Image(file=BytesIO(response.content)) "
-              f"generated exception from {uri} {e}")
+        print(
+            f"wand.image.Image(file=BytesIO(response.content)) "
+            f"generated exception from {uri} {e}"
+        )
         return False
 
-    img.transform(resize='825x1600>')
+    img.transform(resize="825x1600>")
 
-    if img.format == 'JPEG':
+    if img.format == "JPEG":
         img.save(filename="fp.jpg")
         img.close()
     else:
@@ -949,13 +1042,20 @@ def image_hash():
         return "PIL not available", 500
 
     # Get device ID from header
-    device_mac = request.headers.get('X-Device-MAC', DEFAULT_DEVICE_ID)
-    device_id = normalize_mac(device_mac) if device_mac != DEFAULT_DEVICE_ID else DEFAULT_DEVICE_ID
+    device_mac = request.headers.get("X-Device-MAC", DEFAULT_DEVICE_ID)
+    device_id = (
+        normalize_mac(device_mac)
+        if device_mac != DEFAULT_DEVICE_ID
+        else DEFAULT_DEVICE_ID
+    )
     log_battery_status(device_id)
     g.device_id = device_id
     log_message("Hash request", device_id=device_id)
 
-    image_path = get_pending_image_path(device_id)
+    if _preview_state["enabled"] and _preview_state["image_path"]:
+        image_path = _preview_state["image_path"]
+    else:
+        image_path = get_pending_image_path(device_id)
     if not image_path:
         log_message("Hash request: no pending image", device_id=device_id)
         return "No image", 404
@@ -982,26 +1082,42 @@ def device_config():
     The firmware persists any provided values locally and uses its own RTC-backed
     clock plus active window logic to decide how long to sleep.
     """
-    device_mac = request.headers.get('X-Device-MAC', DEFAULT_DEVICE_ID)
-    device_id = normalize_mac(device_mac) if device_mac != DEFAULT_DEVICE_ID else DEFAULT_DEVICE_ID
+    device_mac = request.headers.get("X-Device-MAC", DEFAULT_DEVICE_ID)
+    device_id = (
+        normalize_mac(device_mac)
+        if device_mac != DEFAULT_DEVICE_ID
+        else DEFAULT_DEVICE_ID
+    )
     g.device_id = None if device_id == DEFAULT_DEVICE_ID else device_id
     log_battery_status(device_id, emit_log=True)
 
-    schedule_config, config_source = get_device_schedule_config(device_id)
-
-    payload = {
-        'device_id': device_id,
-        'server_time_epoch': int(datetime.now().timestamp()),
-        'config_source': config_source,
-    }
-    payload.update(schedule_config)
-
-    log_message(
-        f"Device config: refresh_interval_minutes={payload.get('refresh_interval_minutes')} "
-        f"active_hours={payload.get('active_start_hour')}-{payload.get('active_end_hour')} "
-        f"timezone_offset_minutes={payload.get('timezone_offset_minutes')}",
-        device_id=g.device_id,
-    )
+    if _preview_state["enabled"]:
+        # Override schedule: always active, fast refresh, no quiet hours.
+        payload = {
+            "device_id": device_id,
+            "server_time_epoch": int(datetime.now().timestamp()),
+            "config_source": "preview",
+            "refresh_interval_minutes": 3,
+            "active_start_hour": 0,
+            "active_end_hour": 0,  # start == end triggers always-active in firmware
+            "timezone_offset_minutes": 0,
+            "preview_mode": True,
+        }
+        log_message("Device config (preview mode)", device_id=g.device_id)
+    else:
+        schedule_config, config_source = get_device_schedule_config(device_id)
+        payload = {
+            "device_id": device_id,
+            "server_time_epoch": int(datetime.now().timestamp()),
+            "config_source": config_source,
+        }
+        payload.update(schedule_config)
+        log_message(
+            f"Device config: refresh_interval_minutes={payload.get('refresh_interval_minutes')} "
+            f"active_hours={payload.get('active_start_hour')}-{payload.get('active_end_hour')} "
+            f"timezone_offset_minutes={payload.get('timezone_offset_minutes')}",
+            device_id=g.device_id,
+        )
 
     return jsonify(payload)
 
@@ -1009,39 +1125,45 @@ def device_config():
 @app.route("/schedule")
 def schedule_editor():
     """Small web UI for editing schedule overrides."""
-    target = normalize_schedule_target(request.args.get('target'))
-    message = request.args.get('message', '')
-    error = request.args.get('error', '')
+    target = normalize_schedule_target(request.args.get("target"))
+    message = request.args.get("message", "")
+    error = request.args.get("error", "")
     return render_schedule_editor(target, message=message, error=error)
 
 
 @app.route("/schedule/save", methods=["POST"])
 def schedule_save():
     """Save a schedule override JSON file."""
-    target = normalize_schedule_target(request.form.get('target'))
-    redirect_to = request.form.get('redirect_to', '/schedule') or '/schedule'
+    target = normalize_schedule_target(request.form.get("target"))
+    redirect_to = request.form.get("redirect_to", "/schedule") or "/schedule"
     config, error = parse_schedule_form(request.form)
     if error:
-        if redirect_to == '/':
+        if redirect_to == "/":
             return redirect(f"/?error={quote_plus(error)}")
         return render_schedule_editor(target, error=error)
 
     path = get_schedule_config_path(target)
     save_schedule_config(path, config)
-    if redirect_to == '/':
+    if redirect_to == "/":
         return redirect(f"/?message={quote_plus('Schedule override saved')}")
-    return redirect(f"/schedule?target={target}&message={quote_plus('Schedule override saved')}")
+    return redirect(
+        f"/schedule?target={target}&message={quote_plus('Schedule override saved')}"
+    )
 
 
 @app.route("/schedule/clear", methods=["POST"])
 def schedule_clear():
     """Delete the exact schedule override file for a target."""
-    target = normalize_schedule_target(request.form.get('target'))
-    redirect_to = request.form.get('redirect_to', '/schedule') or '/schedule'
+    target = normalize_schedule_target(request.form.get("target"))
+    redirect_to = request.form.get("redirect_to", "/schedule") or "/schedule"
     path = get_schedule_config_path(target)
     deleted = delete_schedule_config(path)
-    message = "Schedule override cleared" if deleted else "No override file existed for this target"
-    if redirect_to == '/':
+    message = (
+        "Schedule override cleared"
+        if deleted
+        else "No override file existed for this target"
+    )
+    if redirect_to == "/":
         return redirect(f"/?message={quote_plus(message)}")
     return redirect(f"/schedule?target={target}&message={quote_plus(message)}")
 
@@ -1062,14 +1184,23 @@ def image_packed():
         return "PIL not available", 500
 
     # Get device ID from header
-    device_mac = request.headers.get('X-Device-MAC', DEFAULT_DEVICE_ID)
-    device_id = normalize_mac(device_mac) if device_mac != DEFAULT_DEVICE_ID else DEFAULT_DEVICE_ID
+    device_mac = request.headers.get("X-Device-MAC", DEFAULT_DEVICE_ID)
+    device_id = (
+        normalize_mac(device_mac)
+        if device_mac != DEFAULT_DEVICE_ID
+        else DEFAULT_DEVICE_ID
+    )
     log_battery_status(device_id)
     g.device_id = device_id
     log_message("Image request", device_id=device_id)
 
-    # Resolve the next image without advancing so /hash and /image_packed stay in sync.
-    image_path = get_pending_image_path(device_id)
+    # In preview mode serve the fixed image; otherwise use the normal rotation.
+    if _preview_state["enabled"] and _preview_state["image_path"]:
+        image_path = _preview_state["image_path"]
+        advance_rotation = False
+    else:
+        image_path = get_pending_image_path(device_id)
+        advance_rotation = True
     if not image_path:
         return "No images available", 404
 
@@ -1079,7 +1210,8 @@ def image_packed():
             return "Failed to process image", 500
 
         image_name = os.path.basename(image_path)
-        _rotator.mark_image_served(device_id)
+        if advance_rotation:
+            _rotator.mark_image_served(device_id)
         log_message(
             f"Image response: image={image_name} hash={image_hash} bytes={len(packed_data)}",
             device_id=device_id,
@@ -1087,14 +1219,14 @@ def image_packed():
 
         return Response(
             packed_data,
-            mimetype='application/octet-stream',
+            mimetype="application/octet-stream",
             headers={
-                'Content-Length': str(len(packed_data)),
-                'Content-Disposition': 'attachment; filename=image.bin',
-                'X-Image-Hash': image_hash,
-                'X-Image-Name': image_name,
-                'X-Device-ID': device_id
-            }
+                "Content-Length": str(len(packed_data)),
+                "Content-Disposition": "attachment; filename=image.bin",
+                "X-Image-Hash": image_hash,
+                "X-Image-Name": image_name,
+                "X-Device-ID": device_id,
+            },
         )
     except Exception as e:
         log_message(f"Error processing image: {e}", device_id=device_id)
@@ -1107,10 +1239,10 @@ def image():
     if not os.path.exists("image.jpg"):
         return "image.jpg not found", 404
 
-    with wand.image.Image(filename='image.jpg') as img:
+    with wand.image.Image(filename="image.jpg") as img:
         img.rotate(90)
-        img.transform(resize='825x1600^')
-        img.crop(width=825, height=1600, gravity='center')
+        img.transform(resize="825x1600^")
+        img.crop(width=825, height=1600, gravity="center")
         img.save(filename="transformed_image.jpg")
 
     return send_file("transformed_image.jpg", mimetype="image/jpg")
@@ -1138,7 +1270,7 @@ def current():
     Without a device identifier, returns status for all known devices.
     """
     # Get device ID from header or query param
-    device_mac = request.headers.get('X-Device-MAC') or request.args.get('device')
+    device_mac = request.headers.get("X-Device-MAC") or request.args.get("device")
 
     if device_mac:
         device_id = normalize_mac(device_mac)
@@ -1146,18 +1278,24 @@ def current():
         current_path = get_current_image_path(device_id)
         schedule_config, config_source = get_device_schedule_config(device_id)
 
-        return jsonify({
-            'device_id': device_id,
-            'current_image': os.path.basename(current_path) if current_path else None,
-            'current_path': current_path,
-            'rotation': status,
-            'schedule_config': schedule_config,
-            'config_source': config_source,
-            'battery': _battery_status.get(device_id),
-            'heic_support': HEIC_SUPPORT,
-            'images_dir': IMAGES_DIR,
-            'fallback_image': DEFAULT_IMAGE_PATH if os.path.exists(DEFAULT_IMAGE_PATH) else None
-        })
+        return jsonify(
+            {
+                "device_id": device_id,
+                "current_image": os.path.basename(current_path)
+                if current_path
+                else None,
+                "current_path": current_path,
+                "rotation": status,
+                "schedule_config": schedule_config,
+                "config_source": config_source,
+                "battery": _battery_status.get(device_id),
+                "heic_support": HEIC_SUPPORT,
+                "images_dir": IMAGES_DIR,
+                "fallback_image": DEFAULT_IMAGE_PATH
+                if os.path.exists(DEFAULT_IMAGE_PATH)
+                else None,
+            }
+        )
     else:
         # Return status for all known devices
         all_devices = _rotator.get_all_devices()
@@ -1167,31 +1305,39 @@ def current():
             current_path = get_current_image_path(dev_id)
             schedule_config, config_source = get_device_schedule_config(dev_id)
             devices_status[dev_id] = {
-                'current_image': os.path.basename(current_path) if current_path else None,
-                'current_path': current_path,
-                'rotation': status,
-                'schedule_config': schedule_config,
-                'config_source': config_source,
-                'battery': _battery_status.get(dev_id)
+                "current_image": os.path.basename(current_path)
+                if current_path
+                else None,
+                "current_path": current_path,
+                "rotation": status,
+                "schedule_config": schedule_config,
+                "config_source": config_source,
+                "battery": _battery_status.get(dev_id),
             }
 
-        return jsonify({
-            'devices': devices_status,
-            'total_devices': len(all_devices),
-            'heic_support': HEIC_SUPPORT,
-            'images_dir': IMAGES_DIR,
-            'fallback_image': DEFAULT_IMAGE_PATH if os.path.exists(DEFAULT_IMAGE_PATH) else None
-        })
+        return jsonify(
+            {
+                "devices": devices_status,
+                "total_devices": len(all_devices),
+                "heic_support": HEIC_SUPPORT,
+                "images_dir": IMAGES_DIR,
+                "fallback_image": DEFAULT_IMAGE_PATH
+                if os.path.exists(DEFAULT_IMAGE_PATH)
+                else None,
+            }
+        )
 
 
 @app.route("/")
 def index():
     """Show available endpoints and multi-device status."""
     all_devices = _rotator.get_all_devices()
-    message = request.args.get('message', '')
-    error = request.args.get('error', '')
-    message_html = f'<div class="message success">{escape(message)}</div>' if message else ''
-    error_html = f'<div class="message error">{escape(error)}</div>' if error else ''
+    message = request.args.get("message", "")
+    error = request.args.get("error", "")
+    message_html = (
+        f'<div class="message success">{escape(message)}</div>' if message else ""
+    )
+    error_html = f'<div class="message error">{escape(error)}</div>' if error else ""
     schedule_cards = [
         render_schedule_form_card(GLOBAL_SCHEDULE_TARGET, redirect_to="/"),
         render_schedule_form_card(DEFAULT_DEVICE_ID, redirect_to="/"),
@@ -1207,28 +1353,28 @@ def index():
         current_name = os.path.basename(current_path) if current_path else "None"
         batt = _battery_status.get(dev_id)
         if batt:
-            v = batt['voltage']
-            color = '#c00' if v < 3.3 else '#c90' if v < 3.7 else '#090'
+            v = batt["voltage"]
+            color = "#c00" if v < 3.3 else "#c90" if v < 3.7 else "#090"
             batt_display = f'<span style="color:{color};font-weight:bold">{v:.2f}V</span><br><small>{batt["timestamp"]}</small>'
         else:
             batt_display = '<span style="color:#999">N/A</span>'
         schedule_config, config_source = get_device_schedule_config(dev_id)
         if schedule_config:
             schedule_summary = (
-                f'{schedule_config.get("active_start_hour", "-")}:00-'
-                f'{schedule_config.get("active_end_hour", "-")}:00 '
-                f'@ {schedule_config.get("timezone_offset_minutes", "-")} min'
+                f"{schedule_config.get('active_start_hour', '-')}:00-"
+                f"{schedule_config.get('active_end_hour', '-')}:00 "
+                f"@ {schedule_config.get('timezone_offset_minutes', '-')} min"
             )
         else:
-            schedule_summary = 'No override'
+            schedule_summary = "No override"
         device_rows += f"""
         <tr>
             <td><code>{dev_id}</code></td>
             <td><code>{current_name}</code></td>
-            <td>{status['total_images']}</td>
+            <td>{status["total_images"]}</td>
             <td>{batt_display}</td>
             <td><code>{escape(schedule_summary)}</code><br><small>{escape(config_source)}</small></td>
-            <td><code>{status['images_dir']}</code></td>
+            <td><code>{status["images_dir"]}</code></td>
             <td><a href="/schedule?target={escape(dev_id)}">Edit</a></td>
         </tr>"""
 
@@ -1265,6 +1411,7 @@ def index():
     </head>
     <body>
     <h1>E-Ink Image Server (Multi-Device)</h1>
+    {"" if not _preview_state["enabled"] else f'<div style="background:#fff3cd;border:2px solid #e6a817;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-weight:bold;">&#9888; Preview mode active &mdash; showing <code>{escape(_preview_state["image_label"] or "")}</code> on all devices. Rotation and scheduling are suspended.</div>'}
     {message_html}
     {error_html}
     <h2>Endpoints</h2>
@@ -1273,6 +1420,8 @@ def index():
         <li><a href="/hash">/hash</a> - Image hash for change detection (16 chars)</li>
         <li><a href="/device_config">/device_config</a> - Current epoch time plus optional schedule overrides</li>
         <li><a href="/schedule">/schedule</a> - Browser UI for editing schedule overrides</li>
+        <li><a href="/upload">/upload</a> - Upload a new image from the browser</li>
+        <li><a href="/">/</a> - Preview mode control (enable/disable fixed-image display)</li>
         <li><a href="/current">/current</a> - Current rotation status (JSON)</li>
         <li><a href="/image">/image</a> - Transformed JPEG preview</li>
         <li><a href="/imagejpg">/imagejpg</a> - Random front page image</li>
@@ -1285,9 +1434,15 @@ def index():
         <li><a href="/schedule?target=default">Edit default device schedule</a></li>
     </ul>
 
+    <h2>Preview Mode</h2>
+    {render_preview_card(redirect_to="/")}
+
+    <h2>Upload Image</h2>
+    {render_upload_card(message=message, error=error, redirect_to="/")}
+
     <h2>Schedule Editor</h2>
     <div class="schedule-grid">
-    {''.join(schedule_cards)}
+    {"".join(schedule_cards)}
     </div>
 
     <h2>Device Status</h2>
@@ -1307,7 +1462,7 @@ def index():
     <h2>Configuration</h2>
     <ul>
         <li>Images directory: <code>{IMAGES_DIR}</code></li>
-        <li>HEIC support: {'Yes' if HEIC_SUPPORT else 'No'}</li>
+        <li>HEIC support: {"Yes" if HEIC_SUPPORT else "No"}</li>
         <li>Fallback image: <code>{DEFAULT_IMAGE_PATH}</code></li>
     </ul>
 
@@ -1331,8 +1486,261 @@ images/
     """
 
 
+def get_all_images() -> list[tuple[str, str]]:
+    """Return sorted list of (label, abs_path) for every image across all device directories."""
+    results: list[tuple[str, str]] = []
+    if not os.path.isdir(IMAGES_DIR):
+        return results
+    for dir_entry in sorted(os.scandir(IMAGES_DIR), key=lambda e: e.name):
+        if not dir_entry.is_dir():
+            continue
+        for img_entry in sorted(os.scandir(dir_entry.path), key=lambda e: e.name):
+            real_path = os.path.realpath(img_entry.path)
+            if not os.path.isfile(real_path):
+                continue
+            _, ext = os.path.splitext(img_entry.name.lower())
+            if ext not in SUPPORTED_EXTENSIONS:
+                continue
+            results.append((f"{dir_entry.name}/{img_entry.name}", img_entry.path))
+    return results
+
+
+def render_preview_card(
+    message: str = "", error: str = "", redirect_to: str = "/"
+) -> str:
+    """Render the preview mode control card."""
+    enabled = _preview_state["enabled"]
+    label = _preview_state["image_label"] or ""
+
+    all_images = get_all_images()
+    options = "\n".join(
+        f'          <option value="{escape(lbl)}" {"selected" if lbl == label else ""}>'
+        f"{escape(lbl)}</option>"
+        for lbl, _ in all_images
+    )
+    no_images_hint = (
+        ""
+        if all_images
+        else '<div class="hint">No images found in images/ directory.</div>'
+    )
+
+    if enabled:
+        status_html = f'<p><strong>Status:</strong> <span style="color:#b05c00;font-weight:bold">PREVIEW ACTIVE</span> &mdash; <code>{escape(label)}</code></p>'
+    else:
+        status_html = (
+            '<p><strong>Status:</strong> <span style="color:#555">Off</span></p>'
+        )
+
+    message_html = (
+        f'<div class="message success">{escape(message)}</div>' if message else ""
+    )
+    error_html = f'<div class="message error">{escape(error)}</div>' if error else ""
+
+    return f"""
+      <div class="card">
+        <h2>Preview Mode</h2>
+        <p class="hint">While active, all devices receive the selected image on every wakeup.
+        Rotation and quiet-hours scheduling are suspended.</p>
+        {message_html}
+        {error_html}
+        {status_html}
+        <form action="/preview/enable" method="POST" style="margin-bottom:10px;">
+          <input type="hidden" name="redirect_to" value="{escape(redirect_to)}">
+          <div class="row">
+            <label for="preview-image">Image to preview</label>
+            <select id="preview-image" name="image" required {"disabled" if not all_images else ""}>
+              {options}
+            </select>
+            {no_images_hint}
+          </div>
+          <button type="submit" {"disabled" if not all_images else ""}>Enable Preview</button>
+        </form>
+        <form action="/preview/disable" method="POST">
+          <input type="hidden" name="redirect_to" value="{escape(redirect_to)}">
+          <button type="submit" class="danger" {"disabled" if not enabled else ""}>Disable Preview</button>
+        </form>
+      </div>
+    """
+
+
+_UPLOAD_ACCEPT = ",".join(f".{e.lstrip('.')}" for e in sorted(SUPPORTED_EXTENSIONS))
+
+
+def render_upload_card(
+    message: str = "", error: str = "", redirect_to: str = "/upload"
+) -> str:
+    dirs = get_image_directories()
+    datalist_options = "\n".join(f'        <option value="{escape(d)}">' for d in dirs)
+    message_html = (
+        f'<div class="message success">{escape(message)}</div>' if message else ""
+    )
+    error_html = f'<div class="message error">{escape(error)}</div>' if error else ""
+    max_mb = app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)
+    ext_hint = ", ".join(sorted(e.lstrip(".").upper() for e in SUPPORTED_EXTENSIONS))
+    return f"""
+      {message_html}
+      {error_html}
+      <div class="card">
+        <h2>Upload Image</h2>
+        <form action="/upload" method="POST" enctype="multipart/form-data">
+          <input type="hidden" name="redirect_to" value="{escape(redirect_to)}">
+          <div class="row">
+            <label for="upload-target">Target Directory</label>
+            <input id="upload-target" type="text" name="target" list="upload-targets"
+                   value="default" required autocomplete="off">
+            <datalist id="upload-targets">
+        {datalist_options}
+            </datalist>
+            <div class="hint">
+              Use <code>default</code> or a device MAC (e.g. <code>d0cf1326f7e8</code>).
+              The directory is created automatically if it does not exist.
+            </div>
+          </div>
+          <div class="row">
+            <label for="upload-file">Image File</label>
+            <input id="upload-file" type="file" name="image" accept="{_UPLOAD_ACCEPT}" required>
+            <div class="hint">Supported: {ext_hint} &mdash; max {max_mb} MB</div>
+          </div>
+          <button type="submit">Upload</button>
+        </form>
+      </div>
+    """
+
+
+@app.route("/upload", methods=["GET"])
+def upload_page():
+    """Standalone upload page."""
+    message = request.args.get("message", "")
+    error = request.args.get("error", "")
+    card = render_upload_card(message=message, error=error, redirect_to="/upload")
+    return f"""<!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Upload Image — E-Ink Server</title>
+      <style>
+        body {{ font-family: Arial, sans-serif; max-width: 720px; margin: 32px auto; padding: 0 16px 48px; background: #f6f7f9; color: #222; }}
+        h1, h2 {{ margin-bottom: 0.4rem; }}
+        .card {{ background: white; border: 1px solid #ddd; border-radius: 8px; padding: 18px; margin-bottom: 16px; }}
+        .row {{ margin-bottom: 14px; }}
+        label {{ display: block; font-weight: bold; margin-bottom: 6px; }}
+        input[type="text"], input[type="file"] {{ width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #ccc; border-radius: 4px; }}
+        button {{ background: #0b67d0; color: white; border: none; padding: 10px 16px; border-radius: 4px; cursor: pointer; }}
+        .message {{ padding: 12px 14px; border-radius: 6px; margin-bottom: 16px; }}
+        .success {{ background: #e7f6ea; border: 1px solid #9bd0a7; }}
+        .error {{ background: #fdecec; border: 1px solid #e2a4a4; }}
+        code {{ background: #eef1f4; border-radius: 4px; padding: 2px 5px; }}
+        .hint {{ color: #555; font-size: 0.95em; }}
+      </style>
+    </head>
+    <body>
+      <h1>Upload Image</h1>
+      <p><a href="/">Back to server status</a></p>
+      {card}
+    </body>
+    </html>"""
+
+
+@app.route("/upload", methods=["POST"])
+def upload_image():
+    """Accept a browser file upload and save it to the appropriate device directory."""
+    redirect_to = request.form.get("redirect_to", "/upload") or "/upload"
+
+    file = request.files.get("image")
+    if not file or not file.filename:
+        error = quote_plus("No file selected.")
+        return redirect(f"{redirect_to}?error={error}")
+
+    filename = secure_filename(file.filename)
+    if not filename:
+        error = quote_plus("Invalid filename.")
+        return redirect(f"{redirect_to}?error={error}")
+
+    ext = os.path.splitext(filename.lower())[1]
+    if ext not in SUPPORTED_EXTENSIONS:
+        allowed = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        error = quote_plus(f"Unsupported file type '{ext}'. Allowed: {allowed}")
+        return redirect(f"{redirect_to}?error={error}")
+
+    target_raw = (
+        request.form.get("target", DEFAULT_DEVICE_ID).strip() or DEFAULT_DEVICE_ID
+    )
+    upload_dir = resolve_upload_dir(target_raw)
+    if upload_dir is None:
+        error = quote_plus(f"Invalid target directory: '{target_raw}'")
+        return redirect(f"{redirect_to}?error={error}")
+
+    os.makedirs(upload_dir, exist_ok=True)
+    dest = os.path.join(upload_dir, filename)
+    file.save(dest)
+
+    # Invalidate the image cache if the overwritten file was cached
+    real_dest = os.path.realpath(dest)
+    if _image_cache.get("source_path") == real_dest:
+        _image_cache["data"] = None
+        _image_cache["hash"] = None
+        _image_cache["source_path"] = None
+        _image_cache["source_mtime"] = None
+
+    target_label = os.path.basename(upload_dir)
+    log_message(f"Uploaded {filename} to images/{target_label}/")
+    message = quote_plus(f"Uploaded '{filename}' to images/{target_label}/")
+    return redirect(f"{redirect_to}?message={message}")
+
+
+@app.route("/preview/enable", methods=["POST"])
+def preview_enable():
+    """Enable preview mode with the selected image."""
+    redirect_to = request.form.get("redirect_to", "/") or "/"
+    image_label = request.form.get("image", "").strip()
+    if not image_label:
+        return redirect(f"{redirect_to}?error={quote_plus('No image selected.')}")
+
+    # Resolve label (e.g. "default/photo.jpg") to an absolute path inside IMAGES_DIR
+    candidate = os.path.realpath(os.path.join(IMAGES_DIR, image_label))
+    images_root = os.path.realpath(IMAGES_DIR)
+    if not candidate.startswith(images_root + os.sep):
+        return redirect(f"{redirect_to}?error={quote_plus('Invalid image path.')}")
+    if not os.path.isfile(candidate):
+        return redirect(
+            f"{redirect_to}?error={quote_plus(f'Image not found: {image_label}')}"
+        )
+
+    _preview_state["enabled"] = True
+    _preview_state["image_path"] = candidate
+    _preview_state["image_label"] = image_label
+
+    # Invalidate the image cache so the new preview image is processed fresh
+    _image_cache["data"] = None
+    _image_cache["hash"] = None
+    _image_cache["source_path"] = None
+    _image_cache["source_mtime"] = None
+
+    log_message(f"Preview mode enabled: {image_label}")
+    return redirect(
+        f"{redirect_to}?message={quote_plus(f'Preview mode enabled: {image_label}')}"
+    )
+
+
+@app.route("/preview/disable", methods=["POST"])
+def preview_disable():
+    """Disable preview mode and resume normal rotation."""
+    redirect_to = request.form.get("redirect_to", "/") or "/"
+    _preview_state["enabled"] = False
+    _preview_state["image_path"] = None
+    _preview_state["image_label"] = None
+    log_message("Preview mode disabled")
+    return redirect(f"{redirect_to}?message={quote_plus('Preview mode disabled')}")
+
+
+@app.errorhandler(413)
+def upload_too_large(e):
+    max_mb = app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)
+    return f"File too large — maximum upload size is {max_mb} MB.", 413
+
+
 if __name__ == "__main__":
-    logging.getLogger('werkzeug').disabled = True
+    logging.getLogger("werkzeug").disabled = True
     print("Starting E-Ink Image Server (Multi-Device)...")
     print(f"PIL available: {PIL_AVAILABLE}")
     print(f"HEIC support: {HEIC_SUPPORT}")
@@ -1342,8 +1750,11 @@ if __name__ == "__main__":
 
     # Check for device directories
     if os.path.isdir(IMAGES_DIR):
-        subdirs = [d for d in os.listdir(IMAGES_DIR)
-                   if os.path.isdir(os.path.join(IMAGES_DIR, d))]
+        subdirs = [
+            d
+            for d in os.listdir(IMAGES_DIR)
+            if os.path.isdir(os.path.join(IMAGES_DIR, d))
+        ]
         if subdirs:
             print(f"Device directories found: {', '.join(subdirs)}")
         else:
@@ -1358,4 +1769,4 @@ if __name__ == "__main__":
     if known_devices:
         print(f"Known devices from state: {', '.join(known_devices)}")
 
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host="0.0.0.0", port=8000)

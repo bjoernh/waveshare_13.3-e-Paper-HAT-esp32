@@ -12,7 +12,7 @@
  *
  * Stored configuration:
  *   - Server host (e.g., "192.168.86.100" or "myserver.example.com")
- *   - Server port (e.g., 5000)
+ *   - Server port (e.g., 8000)
  *   - Image endpoint path (e.g., "/image_packed")
  *   - Refresh interval in minutes
  *   - Active window start/end hour (0-23, local time)
@@ -20,13 +20,13 @@
  */
 
 // Default values (used on first boot or after NVS reset)
-#define DEFAULT_SERVER_HOST "192.168.86.34"
-#define DEFAULT_SERVER_PORT 5000
+#define DEFAULT_SERVER_HOST "192.168.188.6"
+#define DEFAULT_SERVER_PORT 8000
 #define DEFAULT_IMAGE_ENDPOINT "/image_packed"
 #define DEFAULT_SLEEP_MINUTES 15
 #define DEFAULT_ACTIVE_START_HOUR 8
 #define DEFAULT_ACTIVE_END_HOUR 20
-#define DEFAULT_TIMEZONE_OFFSET_MINUTES 0
+#define DEFAULT_TIMEZONE_OFFSET_MINUTES 120
 
 // Maximum string lengths
 #define MAX_HOST_LENGTH 128
